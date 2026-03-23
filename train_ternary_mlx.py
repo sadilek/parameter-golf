@@ -65,11 +65,20 @@ class Hyperparameters:
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
     model_dim: int = int(os.environ.get("MODEL_DIM", 768))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     use_ternary: bool = bool(int(os.environ.get("USE_TERNARY", "1")))
+    use_gru: bool = bool(int(os.environ.get("USE_GRU", "1")))
+    use_metaplastic: bool = bool(int(os.environ.get("USE_METAPLASTIC", "0")))
+    use_hebbian: bool = bool(int(os.environ.get("USE_HEBBIAN", "0")))
+    hebbian_lr: float = float(os.environ.get("HEBBIAN_LR", 0.01))
+    hebbian_ema_decay: float = float(os.environ.get("HEBBIAN_EMA_DECAY", 0.99))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
+    rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Optimizer (Adam for all parameters).
     lr: float = float(os.environ.get("LR", 0.003))
@@ -214,8 +223,95 @@ class CastedLinear(nn.Module):
         return x @ self.weight.astype(x.dtype).T
 
 
-def make_linear(in_dim: int, out_dim: int, use_ternary: bool) -> nn.Module:
+class MetaplasticTernaryLinear(nn.Module):
+    """Ternary linear with metaplastic integer counters (Approach B).
+
+    Each weight has an integer counter. Sign = weight value, magnitude = confidence.
+    Gradients nudge counters probabilistically instead of updating shadow weights.
+    We still use STE for the forward pass but the counters replace Adam's role.
+    """
+    def __init__(self, in_dim: int, out_dim: int, counter_bits: int = 8):
+        super().__init__()
+        self.max_val = 2 ** (counter_bits - 1) - 1
+        # Initialize counters with small random integers.
+        self.weight = (mx.random.normal((out_dim, in_dim)) * 3.0).astype(mx.float32)
+        # A fixed scale learned per-layer; initialized to a reasonable value.
+        self.meta_scale = mx.array(0.02, dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Ternary weight = sign of counter (0 when counter is 0).
+        w_q = mx.sign(self.weight)
+        scale = self.meta_scale
+        w = w_q * scale
+        # STE: forward uses ternary, backward flows to counters.
+        w_ste = self.weight * scale / (mx.mean(mx.abs(self.weight)) + 1e-8)
+        w_ste = w_ste + mx.stop_gradient(w - w_ste)
+        return x @ w_ste.astype(x.dtype).T
+
+
+def make_linear(in_dim: int, out_dim: int, use_ternary: bool, use_metaplastic: bool = False) -> nn.Module:
+    if use_metaplastic:
+        return MetaplasticTernaryLinear(in_dim, out_dim)
     return TernaryLinear(in_dim, out_dim) if use_ternary else CastedLinear(in_dim, out_dim)
+
+
+# ==============================================================================
+# CAUSAL SELF-ATTENTION (FOR USE_GRU=0)
+# ==============================================================================
+
+def apply_rotary_emb(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return mx.concatenate([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], axis=-1)
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head attention with RoPE and GQA, using optional ternary projections."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
+                 qk_gain_init: float, use_ternary: bool, use_metaplastic: bool = False):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_q = make_linear(dim, dim, use_ternary, use_metaplastic)
+        self.c_k = make_linear(dim, kv_dim, use_ternary, use_metaplastic)
+        self.c_v = make_linear(dim, kv_dim, use_ternary, use_metaplastic)
+        self.proj = make_linear(dim, dim, use_ternary, use_metaplastic)
+        self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
+        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.scale = self.head_dim ** -0.5
+
+    def __call__(self, x: mx.array) -> mx.array:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class ReluSquaredMLP(nn.Module):
+    """ReLU² MLP from baseline (for USE_GRU=0 mode)."""
+    def __init__(self, dim: int, mlp_mult: int, use_ternary: bool, use_metaplastic: bool = False):
+        super().__init__()
+        hidden = dim * mlp_mult
+        self.fc = make_linear(dim, hidden, use_ternary, use_metaplastic)
+        self.proj = make_linear(hidden, dim, use_ternary, use_metaplastic)
+        self.proj.weight = mx.zeros_like(self.proj.weight)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = nn.relu(self.fc(x))
+        return self.proj(x * x)
 
 
 # ==============================================================================
@@ -263,12 +359,12 @@ class GatedRecurrence(nn.Module):
     Computes gates in parallel, then runs a parallel scan for the recurrence.
     No softmax, no attention scores — just element-wise gating.
     """
-    def __init__(self, dim: int, use_ternary: bool = True):
+    def __init__(self, dim: int, use_ternary: bool = True, use_metaplastic: bool = False):
         super().__init__()
         self.dim = dim
         # Fused projection for forget gate, candidate, and output gate.
-        self.gates_proj = make_linear(dim, 3 * dim, use_ternary)
-        self.out_proj = make_linear(dim, dim, use_ternary)
+        self.gates_proj = make_linear(dim, 3 * dim, use_ternary, use_metaplastic)
+        self.out_proj = make_linear(dim, dim, use_ternary, use_metaplastic)
         # Zero-init output projection so initial blocks are near-identity.
         self.out_proj.weight = mx.zeros_like(self.out_proj.weight)
         # Forget gate bias: sigmoid(2.0) ≈ 0.88, so initial state mostly remembers.
@@ -298,18 +394,19 @@ class GatedRecurrence(nn.Module):
 # ==============================================================================
 
 class GatedMLP(nn.Module):
-    """Sigmoid-gated MLP replacing ReLU² MLP. Gate modulates value before output projection."""
-    def __init__(self, dim: int, mlp_mult: int, use_ternary: bool = True):
+    """Sigmoid-gated MLP. Fuses gate+value into one projection for fewer kernel launches."""
+    def __init__(self, dim: int, mlp_mult: int, use_ternary: bool = True, use_metaplastic: bool = False):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.gate_proj = make_linear(dim, hidden, use_ternary)
-        self.value_proj = make_linear(dim, hidden, use_ternary)
-        self.out_proj = make_linear(hidden, dim, use_ternary)
+        self.hidden = dim * mlp_mult
+        # Fused gate+value: one matmul (dim → 2*hidden) instead of two (dim → hidden).
+        self.gate_value_proj = make_linear(dim, 2 * self.hidden, use_ternary, use_metaplastic)
+        self.out_proj = make_linear(self.hidden, dim, use_ternary, use_metaplastic)
         self.out_proj.weight = mx.zeros_like(self.out_proj.weight)
 
     def __call__(self, x: mx.array) -> mx.array:
-        gate = mx.sigmoid(self.gate_proj(x))
-        value = self.value_proj(x)
+        gv = self.gate_value_proj(x)
+        gate = mx.sigmoid(gv[:, :, :self.hidden])
+        value = gv[:, :, self.hidden:]
         return self.out_proj(gate * value)
 
 
@@ -322,45 +419,75 @@ class RMSNormNoWeight(nn.Module):
         return rms_norm(x)
 
 
-class Block(nn.Module):
-    """Pre-norm → token mix → SubLN → residual, pre-norm → channel mix → SubLN → residual."""
-    def __init__(self, dim: int, mlp_mult: int, use_ternary: bool = True):
+class GRUBlock(nn.Module):
+    """Pre-norm → GRU → SubLN → residual, pre-norm → GatedMLP → SubLN → residual."""
+    def __init__(self, dim: int, mlp_mult: int, use_ternary: bool = True, use_metaplastic: bool = False):
         super().__init__()
-        self.pre_gru_norm = RMSNormNoWeight()
-        self.gru = GatedRecurrence(dim, use_ternary)
-        self.post_gru_norm = RMSNormNoWeight()      # SubLN (critical for ternary stability)
+        self.pre_token_norm = RMSNormNoWeight()
+        self.token_mixer = GatedRecurrence(dim, use_ternary, use_metaplastic)
+        self.post_token_norm = RMSNormNoWeight()
 
         self.pre_mlp_norm = RMSNormNoWeight()
-        self.mlp = GatedMLP(dim, mlp_mult, use_ternary)
-        self.post_mlp_norm = RMSNormNoWeight()       # SubLN
+        self.channel_mixer = GatedMLP(dim, mlp_mult, use_ternary, use_metaplastic)
+        self.post_mlp_norm = RMSNormNoWeight()
 
-        # Learnable residual scales (same pattern as baseline).
-        self.gru_scale = mx.ones((dim,), dtype=mx.float32)
+        self.token_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        h = self.gru(self.pre_gru_norm(x))
-        h = self.post_gru_norm(h)
-        x = x + self.gru_scale.astype(x.dtype)[None, None, :] * h
+        h = self.token_mixer(self.pre_token_norm(x))
+        h = self.post_token_norm(h)
+        x = x + self.token_scale.astype(x.dtype)[None, None, :] * h
+        m = self.channel_mixer(self.pre_mlp_norm(x))
+        m = self.post_mlp_norm(m)
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * m
+        return x
 
-        m = self.mlp(self.pre_mlp_norm(x))
+
+class AttnBlock(nn.Module):
+    """Pre-norm → Attention → SubLN → residual, pre-norm → ReLU²MLP → SubLN → residual."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, use_ternary: bool, use_metaplastic: bool = False):
+        super().__init__()
+        self.pre_token_norm = RMSNormNoWeight()
+        self.token_mixer = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_ternary, use_metaplastic)
+        self.post_token_norm = RMSNormNoWeight()
+
+        self.pre_mlp_norm = RMSNormNoWeight()
+        self.channel_mixer = ReluSquaredMLP(dim, mlp_mult, use_ternary, use_metaplastic)
+        self.post_mlp_norm = RMSNormNoWeight()
+
+        self.token_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        h = self.token_mixer(self.pre_token_norm(x))
+        h = self.post_token_norm(h)
+        x = x + self.token_scale.astype(x.dtype)[None, None, :] * h
+        m = self.channel_mixer(self.pre_mlp_norm(x))
         m = self.post_mlp_norm(m)
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * m
         return x
 
 
 class TernaryModel(nn.Module):
-    """Gated-recurrence language model with ternary weights."""
+    """Language model supporting both GRU and attention token mixing, with optional ternary weights."""
     def __init__(
         self,
         vocab_size: int,
         num_layers: int,
         dim: int,
+        num_heads: int,
+        num_kv_heads: int,
         mlp_mult: int,
         logit_softcap: float,
         logit_chunk_tokens: int,
         tied_embed_init_std: float,
         use_ternary: bool,
+        use_gru: bool,
+        use_metaplastic: bool = False,
+        rope_base: float = 10000.0,
+        qk_gain_init: float = 1.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -369,7 +496,11 @@ class TernaryModel(nn.Module):
         self.logit_chunk_tokens = logit_chunk_tokens
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.blocks = [Block(dim, mlp_mult, use_ternary) for _ in range(num_layers)]
+        if use_gru:
+            self.blocks = [GRUBlock(dim, mlp_mult, use_ternary, use_metaplastic) for _ in range(num_layers)]
+        else:
+            self.blocks = [AttnBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_ternary, use_metaplastic)
+                           for _ in range(num_layers)]
         self.final_norm = RMSNormNoWeight()
 
         # Initialize embedding (small std, fp16 — same as baseline).
@@ -682,6 +813,107 @@ def ternary_diagnostics(model: TernaryModel) -> dict[str, float]:
 
 
 # ==============================================================================
+# HEBBIAN TRAINING (APPROACH C — NO BACKPROPAGATION)
+# ==============================================================================
+
+def hebbian_step(
+    model: TernaryModel,
+    input_ids: mx.array,
+    target_ids: mx.array,
+    lr: float,
+    baseline_loss: float | None,
+    ema_decay: float = 0.99,
+) -> tuple[float, float]:
+    """One training step using three-factor Hebbian learning. No backpropagation.
+
+    For each linear layer, the update is:
+        Δw = -lr * error_signal * sign(post.T @ pre)
+    where:
+        pre  = input to the linear layer
+        post = output of the linear layer
+        error_signal = current_loss - EMA(loss)   (REINFORCE-style baseline)
+
+    When loss is better than average (error < 0), reinforce current correlations.
+    When loss is worse than average (error > 0), weaken current correlations.
+    """
+    # Collect (linear_module, pre_activation, post_activation) during forward pass.
+    pairs: list[tuple[nn.Module, mx.array, mx.array]] = []
+
+    x = rms_norm(model.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+
+    for block in model.blocks:
+        # --- Token mixer (GRU) ---
+        gru = block.token_mixer
+        normed = block.pre_token_norm(x)
+
+        pre_gates = normed
+        gates = gru.gates_proj(normed)
+        pairs.append((gru.gates_proj, pre_gates, gates))
+
+        D = gru.dim
+        f = mx.sigmoid(gates[:, :, :D] + gru.forget_bias)
+        c = gates[:, :, D:2*D] * mx.sigmoid(gates[:, :, D:2*D])
+        o = mx.sigmoid(gates[:, :, 2*D:])
+        h_all = parallel_scan(f, (1.0 - f) * c)
+
+        pre_out = h_all * o
+        gru_out = gru.out_proj(pre_out)
+        pairs.append((gru.out_proj, pre_out, gru_out))
+
+        token_out = block.post_token_norm(gru_out)
+        x = x + block.token_scale.astype(x.dtype)[None, None, :] * token_out
+
+        # --- Channel mixer (GatedMLP) ---
+        mlp = block.channel_mixer
+        normed = block.pre_mlp_norm(x)
+
+        gate_raw = mlp.gate_proj(normed)
+        pairs.append((mlp.gate_proj, normed, gate_raw))
+
+        value = mlp.value_proj(normed)
+        pairs.append((mlp.value_proj, normed, value))
+
+        gated = mx.sigmoid(gate_raw) * value
+        mlp_out = mlp.out_proj(gated)
+        pairs.append((mlp.out_proj, gated, mlp_out))
+
+        mlp_out = block.post_mlp_norm(mlp_out)
+        x = x + block.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
+
+    # Compute loss (for error signal + logging).
+    x_flat = model.final_norm(x).reshape(-1, model.tok_emb.weight.shape[1])
+    y_flat = target_ids.reshape(-1)
+    logits = model.softcap(x_flat @ model.tok_emb.weight.astype(x_flat.dtype).T)
+    loss = nn.losses.cross_entropy(logits.astype(mx.float32), y_flat, reduction="mean")
+    mx.eval(loss)
+    loss_val = float(loss.item())
+
+    # Update baseline (EMA).
+    if baseline_loss is None:
+        baseline_loss = loss_val
+    else:
+        baseline_loss = ema_decay * baseline_loss + (1.0 - ema_decay) * loss_val
+
+    # Error signal: positive when worse than average.
+    error_signal = loss_val - baseline_loss
+
+    # Apply three-factor Hebbian updates to all linear layers.
+    effective_lr = lr * error_signal
+    for linear, pre, post in pairs:
+        pre_flat = pre.reshape(-1, pre.shape[-1]).astype(mx.float32)
+        post_flat = post.reshape(-1, post.shape[-1]).astype(mx.float32)
+        # Normalized correlation — divide by N so LR doesn't depend on batch size.
+        N = float(pre_flat.shape[0])
+        correlation = post_flat.T @ pre_flat / N
+        hebbian = mx.sign(correlation)
+        linear.weight = linear.weight - (effective_lr * hebbian).astype(linear.weight.dtype)
+    # Materialize all weight updates.
+    mx.eval(*[p[0].weight for p in pairs])
+
+    return loss_val, baseline_loss
+
+
+# ==============================================================================
 # TRAINING
 # ==============================================================================
 
@@ -722,11 +954,17 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         logit_softcap=args.logit_softcap,
         logit_chunk_tokens=args.logit_chunk_tokens,
         tied_embed_init_std=args.tied_embed_init_std,
         use_ternary=args.use_ternary,
+        use_gru=args.use_gru,
+        use_metaplastic=args.use_metaplastic,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
     )
     opt = optim.Adam(learning_rate=args.lr, betas=[args.beta1, args.beta2], eps=args.adam_eps)
 
@@ -742,7 +980,8 @@ def main() -> None:
     n_ternary = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()) if p.ndim == 2 and p.size > 4096)
     est_artifact_mb = (n_ternary * 2 / 8 + (n_params - n_ternary) * 2) / 1e6 if args.use_ternary else n_params * 1 / 1e6
     log(f"run_id:{args.run_id}")
-    log(f"architecture:gated_recurrence+gated_mlp use_ternary:{args.use_ternary}")
+    arch = "gru+gated_mlp" if args.use_gru else "attention+relu2_mlp"
+    log(f"architecture:{arch} use_ternary:{args.use_ternary} use_metaplastic:{args.use_metaplastic} use_hebbian:{args.use_hebbian}")
     log(f"model_params:{n_params} ternary_params:{n_ternary} est_artifact:{est_artifact_mb:.1f}MB")
     log(f"layers:{args.num_layers} dim:{args.model_dim} mlp_mult:{args.mlp_mult} seq_len:{args.train_seq_len}")
     log(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps}")
@@ -784,6 +1023,7 @@ def main() -> None:
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
+    hebbian_baseline: float | None = None
     t0 = time.perf_counter()
     step = 0
 
@@ -803,26 +1043,37 @@ def main() -> None:
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
 
-        accum: dict[str, mx.array] | None = None
-        train_loss = mx.array(0.0, dtype=mx.float32)
-        grad_scale = 1.0 / args.grad_accum_steps
-        for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
-            accum = accumulate_flat_grads(accum, grads, grad_scale)
-            train_loss = train_loss + loss.astype(mx.float32) * grad_scale
-            if args.mlx_eager_eval:
-                mx.eval(train_loss, accum)
+        if args.use_hebbian:
+            # --- Hebbian path: no backprop, no Adam ---
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
+            train_loss_value, hebbian_baseline = hebbian_step(
+                model, x, y,
+                lr=args.hebbian_lr * lr_mul,
+                baseline_loss=hebbian_baseline,
+                ema_decay=args.hebbian_ema_decay,
+            )
+        else:
+            # --- Standard gradient path ---
+            accum: dict[str, mx.array] | None = None
+            train_loss = mx.array(0.0, dtype=mx.float32)
+            grad_scale = 1.0 / args.grad_accum_steps
+            for _ in range(args.grad_accum_steps):
+                loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                accum = accumulate_flat_grads(accum, grads, grad_scale)
+                train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+                if args.mlx_eager_eval:
+                    mx.eval(train_loss, accum)
 
-        grads = tree_unflatten(list(accum.items()))
-        grads = clip_grad_tree(grads, args.grad_clip_norm)
-        train_loss_value = float(train_loss.item())
+            grads = tree_unflatten(list(accum.items()))
+            grads = clip_grad_tree(grads, args.grad_clip_norm)
+            train_loss_value = float(train_loss.item())
 
-        # Adam update with LR scheduling.
-        opt.learning_rate = args.lr * lr_mul
-        params = dict(tree_flatten(model.parameters()))
-        flat_grads = dict(tree_flatten(grads))
-        updated = opt.apply_gradients(flat_grads, params)
-        model.update(tree_unflatten(list(updated.items())))
+            # Adam update with LR scheduling.
+            opt.learning_rate = args.lr * lr_mul
+            params = dict(tree_flatten(model.parameters()))
+            flat_grads = dict(tree_flatten(grads))
+            updated = opt.apply_gradients(flat_grads, params)
+            model.update(tree_unflatten(list(updated.items())))
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
