@@ -521,7 +521,6 @@ def main() -> None:
         compute_dtype = torch.bfloat16
     else:
         compute_dtype = torch.float16
-    log0(f"compute_dtype:{compute_dtype}")
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
