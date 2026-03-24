@@ -567,7 +567,11 @@ def main() -> None:
             if p.ndim < 2 or "scale" in name or "bias" in name or "norm" in name:
                 p.data = p.data.float()
 
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    use_compile = bool(int(os.environ.get("USE_COMPILE", "0")))
+    if use_compile:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # --- Optimizer (Adam for all params) ---
