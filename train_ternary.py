@@ -146,7 +146,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -511,6 +511,13 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
+    # Auto-detect compute dtype: bfloat16 on Ampere+, float16 on older (T4, V100).
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    if any(x in gpu_name for x in ["a100", "h100", "l40", "a10", "rtx 30", "rtx 40", "rtx 50"]):
+        compute_dtype = torch.bfloat16
+    else:
+        compute_dtype = torch.float16
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -557,7 +564,7 @@ def main() -> None:
         num_cycles=args.num_cycles,
     ).to(device)
     # Keep TernaryLinear weights in fp32 (shadow weights). Everything else in bf16.
-    base_model.bfloat16()
+    base_model.to(compute_dtype)
     for m in base_model.modules():
         if isinstance(m, TernaryLinear):
             m.weight.data = m.weight.data.float()
@@ -621,7 +628,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                     loss = model(x, y)
                 (loss * grad_scale).backward()
             optimizer.step()
@@ -670,7 +677,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
