@@ -35,6 +35,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Default compute dtype; overridden in main() based on GPU capability.
+compute_dtype = torch.bfloat16
+
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
@@ -512,11 +515,13 @@ def main() -> None:
     master_process = rank == 0
 
     # Auto-detect compute dtype: bfloat16 on Ampere+, float16 on older (T4, V100).
+    global compute_dtype
     gpu_name = torch.cuda.get_device_name(0).lower()
     if any(x in gpu_name for x in ["a100", "h100", "l40", "a10", "rtx 30", "rtx 40", "rtx 50"]):
         compute_dtype = torch.bfloat16
     else:
         compute_dtype = torch.float16
+    log0(f"compute_dtype:{compute_dtype}")
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
