@@ -74,6 +74,12 @@ class Hyperparameters:
     use_hebbian: bool = bool(int(os.environ.get("USE_HEBBIAN", "0")))
     hebbian_lr: float = float(os.environ.get("HEBBIAN_LR", 0.01))
     hebbian_ema_decay: float = float(os.environ.get("HEBBIAN_EMA_DECAY", 0.99))
+    # Think/Know architecture: shared "thinking" layers + unique "knowledge" layers.
+    # THINK_DEPTH=0 disables this (all layers unique, original behavior).
+    think_depth: int = int(os.environ.get("THINK_DEPTH", 0))
+    num_know_layers: int = int(os.environ.get("NUM_KNOW_LAYERS", 6))
+    num_cycles: int = int(os.environ.get("NUM_CYCLES", 1))
+
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -471,7 +477,13 @@ class AttnBlock(nn.Module):
 
 
 class TernaryModel(nn.Module):
-    """Language model supporting both GRU and attention token mixing, with optional ternary weights."""
+    """Language model with optional Think/Know weight sharing.
+
+    When think_depth=0: all layers are unique (original behavior).
+    When think_depth>0: shared "thinking" layers alternate with unique "knowledge" layers.
+    The execution sequence per cycle is: [T1..Td, K1, T1..Td, K2, ..., T1..Td, Kn]
+    With num_cycles>1, the knowledge layers are revisited.
+    """
     def __init__(
         self,
         vocab_size: int,
@@ -488,19 +500,45 @@ class TernaryModel(nn.Module):
         use_metaplastic: bool = False,
         rope_base: float = 10000.0,
         qk_gain_init: float = 1.5,
+        think_depth: int = 0,
+        num_know_layers: int = 6,
+        num_cycles: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_softcap = logit_softcap
         self.logit_chunk_tokens = logit_chunk_tokens
+        self.think_depth = think_depth
+        self.num_know_layers = num_know_layers
+        self.num_cycles = num_cycles
+
+        def make_block():
+            if use_gru:
+                return GRUBlock(dim, mlp_mult, use_ternary, use_metaplastic)
+            return AttnBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_ternary, use_metaplastic)
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        if use_gru:
-            self.blocks = [GRUBlock(dim, mlp_mult, use_ternary, use_metaplastic) for _ in range(num_layers)]
+
+        if think_depth > 0:
+            # Think/Know architecture: shared think blocks + unique know blocks.
+            self.think_blocks = [make_block() for _ in range(think_depth)]
+            self.know_blocks = [make_block() for _ in range(num_know_layers)]
+            # Build execution sequence as (source_list, index) pairs.
+            self._sequence: list[tuple[str, int]] = []
+            for _ in range(num_cycles):
+                for k in range(num_know_layers):
+                    for t in range(think_depth):
+                        self._sequence.append(("think", t))
+                    self._sequence.append(("know", k))
+            self.blocks = []  # unused, but keeps parameter discovery simple
         else:
-            self.blocks = [AttnBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_ternary, use_metaplastic)
-                           for _ in range(num_layers)]
+            # Original: all unique layers.
+            self.blocks = [make_block() for _ in range(num_layers)]
+            self.think_blocks = []
+            self.know_blocks = []
+            self._sequence = [("block", i) for i in range(num_layers)]
+
         self.final_norm = RMSNormNoWeight()
 
         # Initialize embedding (small std, fp16 — same as baseline).
@@ -512,10 +550,21 @@ class TernaryModel(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    def effective_depth(self) -> int:
+        return len(self._sequence)
+
+    def unique_block_count(self) -> int:
+        return len(self.blocks) + len(self.think_blocks) + len(self.know_blocks)
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        for block in self.blocks:
-            x = block(x)
+        for source, idx in self._sequence:
+            if source == "think":
+                x = self.think_blocks[idx](x)
+            elif source == "know":
+                x = self.know_blocks[idx](x)
+            else:
+                x = self.blocks[idx](x)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -965,6 +1014,9 @@ def main() -> None:
         use_metaplastic=args.use_metaplastic,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        think_depth=args.think_depth,
+        num_know_layers=args.num_know_layers,
+        num_cycles=args.num_cycles,
     )
     opt = optim.Adam(learning_rate=args.lr, betas=[args.beta1, args.beta2], eps=args.adam_eps)
 
@@ -982,6 +1034,9 @@ def main() -> None:
     log(f"run_id:{args.run_id}")
     arch = "gru+gated_mlp" if args.use_gru else "attention+relu2_mlp"
     log(f"architecture:{arch} use_ternary:{args.use_ternary} use_metaplastic:{args.use_metaplastic} use_hebbian:{args.use_hebbian}")
+    if args.think_depth > 0:
+        log(f"think_know: think_depth:{args.think_depth} know_layers:{args.num_know_layers} cycles:{args.num_cycles} "
+            f"unique_blocks:{model.unique_block_count()} effective_depth:{model.effective_depth()}")
     log(f"model_params:{n_params} ternary_params:{n_ternary} est_artifact:{est_artifact_mb:.1f}MB")
     log(f"layers:{args.num_layers} dim:{args.model_dim} mlp_mult:{args.mlp_mult} seq_len:{args.train_seq_len}")
     log(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps}")

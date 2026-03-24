@@ -15,17 +15,17 @@ EXPERIMENTS_200 = {
     "Exp3: Ternary GRU": "exp3_ternary_gru",
     "Exp4: Wide Ternary GRU (1024)": "exp4_ternary_wide",
     "Exp5: Metaplastic GRU": "exp5_metaplastic",
+    "ExpA: Think/Know (1T+6K)": "expA_think_know",
 }
 
 EXPERIMENTS_1K = {
-    "Baseline (Transformer+Muon)": "exp_baseline_1k",
-    "Exp4: Wide Ternary GRU (1024)": "exp4_wide_1k",
-    "Exp5: Metaplastic GRU": "exp5_meta_1k",
-    "Exp6: Hebbian GRU": "exp6_hebbian_1k",
+    "Baseline (Transformer+Muon)": "cmp_baseline",
+    "Exp4: Wide Ternary GRU (1024)": "cmp_exp4",
+    "ExpA: Think/Know (1T+6K)": "cmp_expA",
 }
 
-COLORS_200 = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2"]
-COLORS_1K = ["#2563eb", "#ea580c", "#0891b2", "#a855f7"]
+COLORS_200 = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#d946ef"]
+COLORS_1K = ["#2563eb", "#ea580c", "#d946ef"]
 
 def parse_log(run_id):
     path = LOGS / f"{run_id}.txt"
@@ -83,10 +83,10 @@ for (label, run_id), color in zip(EXPERIMENTS_1K.items(), COLORS_1K):
         ax.plot(steps, losses, label=label, color=color, linewidth=1.5, alpha=0.85)
 ax.set_xlabel("Step")
 ax.set_ylabel("Training Loss")
-ax.set_title("Training Loss (1000 steps, 8192 tok/step, seq_len=512)")
+ax.set_title("Training Loss (1500 steps, 8192 tok/step, seq_len=512)")
 ax.legend(fontsize=8, loc="upper right")
 ax.grid(True, alpha=0.3)
-ax.set_xlim(0, 1000)
+ax.set_xlim(0, 1550)
 
 ax = axes[1]
 for (label, run_id), color in zip(EXPERIMENTS_1K.items(), COLORS_1K):
@@ -96,10 +96,10 @@ for (label, run_id), color in zip(EXPERIMENTS_1K.items(), COLORS_1K):
         ax.plot(steps, bpbs, "o-", label=label, color=color, linewidth=2, markersize=6)
 ax.set_xlabel("Step")
 ax.set_ylabel("Validation BPB (bits-per-byte)")
-ax.set_title("Validation BPB at 1000 steps (lower is better)")
+ax.set_title("Validation BPB at 1500 steps (lower is better)")
 ax.legend(fontsize=8, loc="upper right")
 ax.grid(True, alpha=0.3)
-ax.set_xlim(0, 1050)
+ax.set_xlim(0, 1550)
 
 plt.tight_layout()
 plt.savefig("experiment_plots_1k.png", dpi=150, bbox_inches="tight")
