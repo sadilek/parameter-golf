@@ -39,6 +39,74 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 compute_dtype = torch.bfloat16
 
 # ==============================================================================
+# MUON OPTIMIZER
+# ==============================================================================
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    """Orthogonalize a 2D matrix with Newton-Schulz iteration."""
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer: SGD with momentum + Newton-Schulz orthogonalization for matrix params."""
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+
+# ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
 
@@ -74,8 +142,14 @@ class Hyperparameters:
     num_know_layers = int(os.environ.get("NUM_KNOW_LAYERS", 6))
     num_cycles = int(os.environ.get("NUM_CYCLES", 1))
 
-    # Optimizer (Adam for all parameters).
-    lr = float(os.environ.get("LR", 0.003))
+    # Optimizer: Muon for matrix params, Adam for embeddings/scalars.
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    embed_lr = float(os.environ.get("EMBED_LR", 0.05))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -556,10 +630,13 @@ def main() -> None:
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE mismatch: {args.vocab_size} vs {int(sp.vocab_size())}")
+    log0("loading validation tokens...")
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    log0(f"val_tokens:{val_tokens.numel() - 1}")
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
 
     # --- Model ---
+    log0("creating model...")
     base_model = TernaryGPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
         mlp_mult=args.mlp_mult, logit_softcap=args.logit_softcap,
@@ -585,13 +662,36 @@ def main() -> None:
         compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # --- Optimizer (Adam for all params) ---
-    optimizer = torch.optim.Adam(
-        base_model.parameters(), lr=args.lr,
+    # --- Optimizer: Muon for matrix params, Adam for embeddings/scalars ---
+    # Collect parameter groups by type.
+    matrix_params = []  # 2D TernaryLinear weights → Muon
+    scalar_params = []  # 1D params (scales, biases, norms) → Adam
+    embed_params = []   # embedding weight → Adam with separate LR
+    for name, p in base_model.named_parameters():
+        if "tok_emb" in name:
+            embed_params.append(p)
+        elif p.ndim == 2 and p.numel() > 4096:
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
+
+    optimizer_muon = Muon(
+        matrix_params, lr=args.matrix_lr,
+        momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
+
+    optimizer_embed = torch.optim.Adam(
+        [{"params": embed_params, "lr": args.embed_lr, "base_lr": args.embed_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
     )
-    for group in optimizer.param_groups:
-        group["base_lr"] = args.lr
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_muon, optimizer_embed, optimizer_scalar]
+
     # GradScaler is essential for float16 training (prevents gradient underflow).
     use_scaler = compute_dtype == torch.float16
     scaler = torch.amp.GradScaler(enabled=use_scaler)
@@ -605,7 +705,9 @@ def main() -> None:
         unique = len(list(base_model.think_blocks)) + len(list(base_model.know_blocks))
         log0(f"think_know: think_depth:{args.think_depth} know_layers:{args.num_know_layers} cycles:{args.num_cycles} unique:{unique} effective_depth:{eff_depth}")
     log0(f"dim:{args.model_dim} layers:{args.num_layers} mlp_mult:{args.mlp_mult} seq_len:{args.train_seq_len}")
-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps} lr:{args.lr}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"optimizer:muon+adam matrix_params:{len(matrix_params)} scalar_params:{len(scalar_params)} embed_params:{len(embed_params)}")
+    log0(f"matrix_lr:{args.matrix_lr} embed_lr:{args.embed_lr} scalar_lr:{args.scalar_lr} muon_momentum:{args.muon_momentum}")
     log0(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens}")
 
     # --- Data loader ---
@@ -624,13 +726,17 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def zero_grad_all():
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
     # --- Warmup (primes torch.compile) ---
     if args.warmup_steps > 0:
         initial_model_state = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
-        initial_opt_state = copy.deepcopy(optimizer.state_dict())
+        initial_opt_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            optimizer.zero_grad(set_to_none=True)
+            zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -638,15 +744,18 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                     loss = model(x, y)
                 scaler.scale(loss * grad_scale).backward()
-            scaler.unscale_(optimizer)
+            for opt in optimizers:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
+            for opt in optimizers:
+                scaler.step(opt)
             scaler.update()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
-        optimizer.load_state_dict(initial_opt_state)
-        optimizer.zero_grad(set_to_none=True)
+        for opt, state in zip(optimizers, initial_opt_states):
+            opt.load_state_dict(state)
+        zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -657,11 +766,12 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
+    log0("training_loop:start")
 
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -680,7 +790,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        optimizer.zero_grad(set_to_none=True)
+        zero_grad_all()
         train_loss = torch.zeros((), device=device)
 
         for micro_step in range(grad_accum_steps):
@@ -693,12 +803,22 @@ def main() -> None:
             scaler.scale(loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        for group in optimizer.param_groups:
-            group["lr"] = group["base_lr"] * scale
+        # Muon momentum warmup.
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_mom = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_mom
 
-        scaler.unscale_(optimizer)
+        # LR scheduling for all optimizers.
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+
+        for opt in optimizers:
+            scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
+        for opt in optimizers:
+            scaler.step(opt)
         scaler.update()
 
         step += 1
