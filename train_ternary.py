@@ -592,6 +592,9 @@ def main() -> None:
     )
     for group in optimizer.param_groups:
         group["base_lr"] = args.lr
+    # GradScaler is essential for float16 training (prevents gradient underflow).
+    use_scaler = compute_dtype == torch.float16
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     n_ternary = sum(p.numel() for p in base_model.parameters() if p.ndim == 2 and p.numel() > 4096)
@@ -634,8 +637,11 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                     loss = model(x, y)
-                (loss * grad_scale).backward()
-            optimizer.step()
+                scaler.scale(loss * grad_scale).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
@@ -684,15 +690,16 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            scaler.scale(loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         for group in optimizer.param_groups:
             group["lr"] = group["base_lr"] * scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        optimizer.step()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         step += 1
         approx_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
