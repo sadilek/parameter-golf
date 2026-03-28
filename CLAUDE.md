@@ -37,7 +37,8 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 ## Architecture
 
 ### Training scripts
-- **`train_gpt.py`** — Main PyTorch training script with distributed training (torchrun/NCCL). This is both the baseline and the template for submissions. Hard limit: 1500 lines.
+- **`train_gpt.py`** — Main PyTorch training script with distributed training (torchrun/NCCL). This is both the baseline and the template for submissions.
+- **`train_combined.py`** — Combined ternary submission: forks the ternary record (1.157 BPB) with CDMA superposition training, masked diffusion, LeakyReLU(0.5)², EMA, and score-first TTT.
 - **`train_gpt_mlx.py`** — Apple MLX port for local M-series Mac development. Same model architecture, single-GPU only.
 
 ### Model
