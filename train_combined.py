@@ -126,6 +126,10 @@ class Hyperparameters:
     mask_rate_min = _e("MASK_RATE_MIN", 0.15, float)
     mask_rate_max = _e("MASK_RATE_MAX", 0.85, float)
     # EMA weight averaging.
+    # Local conv for n-gram pattern matching.
+    local_conv_layers = _e("LOCAL_CONV_LAYERS", 0, int)
+    local_conv_kernel = _e("LOCAL_CONV_KERNEL", 7, int)
+    local_conv_bottleneck = _e("LOCAL_CONV_BOTTLENECK", 256, int)
     # EMA disabled by default — causes roundtrip gap with ternary quantization.
     ema_enabled = _e("EMA_ENABLED", 0, bool)
     ema_decay = _e("EMA_DECAY", 0.999, float)
@@ -246,7 +250,7 @@ def q_sd(state_dict: dict, group_size: int = 64, fp_storage=False, ternary_metho
             stats["fp_params"] += t.numel()
             stats["fp_bytes"] += t.numel()
         else:
-            quantized[name] = {"type": "fp16", "data": t.half()}
+            quantized[name] = {"type": "fp16", "data": t.half(), "orig_shape": t_orig_shape}
             stats["fp_params"] += t.numel()
             stats["fp_bytes"] += t.numel() * 2
     return quantized, stats
@@ -274,7 +278,9 @@ def deq_sd(quantized: dict, target_dtype=torch.bfloat16):
         elif entry["type"] == "fp4":
             out[name] = dequantize_from_int4(entry["packed"], entry["scale"], entry["shape"]).to(target_dtype).contiguous()
         else:
-            out[name] = entry["data"].to(target_dtype).contiguous()
+            t = entry["data"].to(target_dtype)
+            orig = entry.get("orig_shape")
+            out[name] = t.reshape(orig).contiguous() if orig and list(t.shape) != orig else t.contiguous()
     return out
 
 # ---------------------------------------------------------------------------
@@ -689,6 +695,36 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(bsz, seqlen, dim)
         return self.tversky_proj(y, self.shared_features) if self.tversky_proj is not None else self.proj(y)
 
+class LocalConv(nn.Module):
+    """Causal depthwise conv with bottleneck projection for local n-gram patterns.
+
+    Uses FP16 depthwise conv (continuous kernels) + ternary bottleneck projection.
+    Bottleneck reduces dim → hidden → dim to save artifact space.
+    """
+    def __init__(self, dim: int, kernel_size: int = 7, num_layers: int = 1, group_size: int = 64,
+                 bottleneck: int = 256):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(nn.ModuleDict({
+                "dw": nn.Conv1d(dim, dim, kernel_size, padding=kernel_size - 1, groups=dim, bias=False),
+                "down": TernaryLinear(dim, bottleneck, bias=False, group_size=group_size),
+                "up": TernaryLinear(bottleneck, dim, bias=False, group_size=group_size),
+                "norm": nn.RMSNorm(dim),
+            }))
+            # Zero-init the up projection so conv starts as identity.
+            self.layers[-1]["up"]._zero_init = True
+            nn.init.zeros_(self.layers[-1]["up"].weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = x
+        for layer in self.layers:
+            # Causal conv: pad left, truncate right.
+            h_conv = layer["dw"](h.transpose(1, 2))[..., :h.shape[1]].transpose(1, 2)
+            h = h + layer["up"](F.silu(layer["down"](layer["norm"](h_conv))))
+        return h
+
+
 class MLP(nn.Module):
     def __init__(self, dim, mlp_mult, group_size=64, activation="swiglu", mlp_groups=0):
         super().__init__()
@@ -792,7 +828,8 @@ class GPT(nn.Module):
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn=False, mlp_groups=0, refiner=False, refiner_kernel=3,
-                 n_channels=1, p_causal=0.2, mask_rate_min=0.15, mask_rate_max=0.85):
+                 n_channels=1, p_causal=0.2, mask_rate_min=0.15, mask_rate_max=0.85,
+                 local_conv_layers=0, local_conv_kernel=7, local_conv_bottleneck=256):
         super().__init__()
         self.training_depth_recurrence = training_depth_recurrence
         self.fp_storage = fp_storage
@@ -818,6 +855,9 @@ class GPT(nn.Module):
         self.embed_proj = QATLinear(self.embed_dim, model_dim, bias=False, fp_storage=fp_storage) if self.embed_dim != model_dim else None
         self.embed_proj_rev = QATLinear(model_dim, self.embed_dim, bias=False, fp_storage=fp_storage) if (
             self.embed_dim != model_dim and logit_head_type != "tversky") else None
+        # Local causal conv for n-gram pattern matching.
+        self.local_conv = LocalConv(model_dim, kernel_size=local_conv_kernel, num_layers=local_conv_layers,
+                                    group_size=group_size, bottleneck=local_conv_bottleneck) if local_conv_layers > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -940,7 +980,7 @@ class GPT(nn.Module):
         return (lse - target_logits).mean() + 1e-4 * (lse ** 2).mean()
 
     def _embed(self, input_ids: Tensor) -> Tensor:
-        """Token embedding + bigram + projection + RMSNorm."""
+        """Token embedding + bigram + projection + local conv + RMSNorm."""
         x = self.tok_emb(input_ids)
         if x.dtype not in (torch.bfloat16, torch.float16):
             x = x.float()
@@ -949,6 +989,8 @@ class GPT(nn.Module):
             x = x + self.bigram_emb(prev).to(x.dtype)
         if self.embed_proj is not None:
             x = self.embed_proj(x)
+        if self.local_conv is not None:
+            x = self.local_conv(x)
         return F.rms_norm(x, (x.size(-1),))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean", temperature: float = 1.0) -> Tensor:
@@ -1242,6 +1284,8 @@ def main() -> None:
         refiner=args.refiner, refiner_kernel=args.refiner_kernel, mlp_groups=args.mlp_groups,
         n_channels=args.n_channels, p_causal=args.p_causal,
         mask_rate_min=args.mask_rate_min, mask_rate_max=args.mask_rate_max,
+        local_conv_layers=args.local_conv_layers, local_conv_kernel=args.local_conv_kernel,
+        local_conv_bottleneck=args.local_conv_bottleneck,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -1308,6 +1352,8 @@ def main() -> None:
     log0(f"params:{n_params} L:{args.num_layers} d:{args.model_dim} h:{args.num_heads} kv:{args.num_kv_heads} ws:{world_size} ga:{grad_accum_steps} s:{args.seed}")
     if args.n_channels > 1:
         log0(f"superposition: channels:{args.n_channels} p_causal:{args.p_causal} mask:[{args.mask_rate_min},{args.mask_rate_max}]")
+    if args.local_conv_layers > 0:
+        log0(f"local_conv: layers:{args.local_conv_layers} kernel:{args.local_conv_kernel}")
     if args.ema_enabled:
         log0(f"ema: decay:{args.ema_decay} start_frac:{args.ema_start_frac}")
 
