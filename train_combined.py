@@ -126,6 +126,7 @@ class Hyperparameters:
     mask_rate_min = _e("MASK_RATE_MIN", 0.15, float)
     mask_rate_max = _e("MASK_RATE_MAX", 0.85, float)
     # EMA weight averaging.
+    # EMA disabled by default — causes roundtrip gap with ternary quantization.
     ema_enabled = _e("EMA_ENABLED", 0, bool)
     ema_decay = _e("EMA_DECAY", 0.999, float)
     ema_start_frac = _e("EMA_START_FRAC", 0.1, float)
@@ -1471,8 +1472,8 @@ def main() -> None:
             opt.step()
         zero_grad_all()
         step += 1
-        # EMA update.
-        if step >= ema_start_step:
+        # EMA update — only on causal steps to preserve ternary-friendly weight distributions.
+        if step >= ema_start_step and base_model._force_causal:
             if ema_state is None:
                 ema_state = {n: t.detach().clone() for n, t in base_model.state_dict().items()}
             else:
