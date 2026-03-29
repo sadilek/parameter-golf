@@ -130,6 +130,10 @@ class Hyperparameters:
     local_conv_layers = _e("LOCAL_CONV_LAYERS", 0, int)
     local_conv_kernel = _e("LOCAL_CONV_KERNEL", 7, int)
     local_conv_bottleneck = _e("LOCAL_CONV_BOTTLENECK", 256, int)
+    # Quantization mode: "ternary" (1.85 bits, ~66M params) or "int6" (6 bits, ~22M params)
+    quant_mode = _e("QUANT_MODE", "ternary")
+    int6_clip_q = _e("INT6_CLIP_Q", 0.9999984, float)
+    late_qat_frac = _e("LATE_QAT_FRAC", 0.0, float)  # fraction of training to start int6 STE (0=always on)
     # EMA disabled by default — causes roundtrip gap with ternary quantization.
     ema_enabled = _e("EMA_ENABLED", 0, bool)
     ema_decay = _e("EMA_DECAY", 0.999, float)
@@ -197,6 +201,80 @@ def dequantize_from_int4(packed: Tensor, scale: Tensor, shape: list) -> Tensor:
     if len(shape) <= 1:
         return (flat * scale.float().squeeze()).reshape(shape)
     return (flat.reshape(-1, shape[-1]) * scale.float().unsqueeze(-1)).reshape(shape)
+
+
+# --- Int6 serialization ---
+INT6_RANGE = 31
+INT6_CLIP_Q_DEFAULT = 0.9999984
+INT6_KEEP_FLOAT_PATTERNS = ("tok_emb", "lm_head", "embed_proj", "bigram_emb", "lm_head_correction", "channel_")
+INT8_RANGE = 127
+
+def quantize_int6(t: Tensor, quant_range: int = INT6_RANGE, clip_q: float = INT6_CLIP_Q_DEFAULT) -> tuple[Tensor, Tensor]:
+    """Per-row int6 quantization. Returns (int8 container, fp16 scale)."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = torch.quantile(t32.abs(), clip_q, dim=1).clamp_min(1e-8) if t32.numel() else torch.zeros(t32.shape[0])
+        scale = (clip_abs / float(quant_range)).clamp_min(1.0 / float(quant_range))
+        clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -quant_range, quant_range).to(torch.int8)
+        return q.contiguous(), scale.half().contiguous()
+    # 1D: use int8 per-tensor
+    clip_abs = float(torch.quantile(t32.abs().flatten(), clip_q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale.float()), -127, 127).to(torch.int8)
+    return q.contiguous(), scale.contiguous()
+
+def q_sd_int6(state_dict: dict, clip_q: float = INT6_CLIP_Q_DEFAULT) -> tuple[dict, dict]:
+    """Quantize state dict: int6 for large 2D matrices, int8 for embeddings, fp16 for small."""
+    result = {}
+    stats = {"int6_params": 0, "int8_params": 0, "fp_params": 0}
+    for name, tensor in state_dict.items():
+        if "mtp_heads" in name:
+            continue
+        t = tensor.detach().cpu().float().contiguous()
+        is_keep_float = any(p in name for p in INT6_KEEP_FLOAT_PATTERNS)
+        if t.ndim >= 2 and t.numel() > 4096 and not is_keep_float:
+            # Int6 per-row for block weights
+            t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
+            q, s = quantize_int6(t2d, INT6_RANGE, clip_q)
+            result[name + ".q"] = q
+            result[name + ".s"] = s
+            result[name + ".shape"] = torch.tensor(list(t.shape))
+            stats["int6_params"] += t.numel()
+        elif t.ndim >= 2 and t.numel() > 4096 and is_keep_float:
+            # Int8 per-row for embeddings (no STE protection)
+            t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
+            q, s = quantize_int6(t2d, INT8_RANGE, clip_q)
+            result[name + ".q"] = q
+            result[name + ".s"] = s
+            result[name + ".shape"] = torch.tensor(list(t.shape))
+            stats["int8_params"] += t.numel()
+        else:
+            result[name] = t.half()
+            stats["fp_params"] += t.numel()
+    return result, stats
+
+def deq_sd_int6(obj: dict, target_dtype=torch.bfloat16) -> dict:
+    """Reconstruct state dict from int6/int8 quantized representation."""
+    out = {}
+    processed = set()
+    for key in list(obj.keys()):
+        if key.endswith(".q"):
+            name = key[:-2]
+            processed.add(name)
+            q = obj[name + ".q"].float()
+            s = obj[name + ".s"].float()
+            shape = obj[name + ".shape"].tolist()
+            if s.ndim == 0:
+                t = (q * s).to(target_dtype)
+            else:
+                t = (q * s[:, None]).to(target_dtype)
+            out[name] = t.reshape(shape).contiguous()
+    for key, val in obj.items():
+        name = key.removesuffix(".q").removesuffix(".s").removesuffix(".shape")
+        if name not in processed and not key.endswith((".q", ".s", ".shape")):
+            out[key] = val.to(target_dtype).contiguous()
+    return out
 
 # ---------------------------------------------------------------------------
 # State dict serialization (ternary + fp16/fp8/fp4)
@@ -480,20 +558,39 @@ class QATEmbedding(nn.Embedding):
         return F.embedding(input, w_qat, self.padding_idx, self.max_norm,
                            self.norm_type, self.scale_grad_by_freq, self.sparse)
 
+# Global quantization mode — set from Hyperparameters in main().
+_QUANT_MODE = "ternary"
+_INT6_CLIP_Q = 0.9999984
+_INT6_ACTIVE = True  # toggled by late QAT schedule
+
 class TernaryLinear(nn.Linear):
+    """Quantized linear layer. Supports ternary ({-1,0,1}) or int6 ([-31,31]) STE."""
     def __init__(self, in_features, out_features, bias=False, group_size=64):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
 
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.bfloat16()
-        g = self.group_size
-        w_g = w.reshape(-1, g)
-        scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
-        q = (w_g / scale).round().clamp(-1, 1)
-        w_ternary = w + ((q * scale).reshape(w.shape) - w).detach()
-        return F.linear(x, w_ternary,
-                        self.bias.to(x.dtype) if self.bias is not None else None)
+        w = self.weight
+        if _QUANT_MODE == "int6" and self.training and _INT6_ACTIVE:
+            # Int6 STE: fake quantize to [-31, 31] per row.
+            with torch.no_grad():
+                w32 = w.float()
+                clip_abs = torch.quantile(w32.abs(), _INT6_CLIP_Q, dim=1).clamp_min(1e-8)
+                scale = clip_abs / 31.0
+                w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
+                w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
+            w = w.to(x.dtype) + (w_q - w.to(x.dtype)).detach()
+        elif _QUANT_MODE == "ternary":
+            # Ternary STE: fake quantize to {-1, 0, 1} per group.
+            w = w.bfloat16()
+            g = self.group_size
+            w_g = w.reshape(-1, g)
+            scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
+            q = (w_g / scale).round().clamp(-1, 1)
+            w = w + ((q * scale).reshape(w.shape) - w).detach()
+        else:
+            w = w.to(x.dtype)
+        return F.linear(x, w, self.bias.to(x.dtype) if self.bias is not None else None)
 
 
 class NormedTernaryLinear(TernaryLinear):
@@ -1350,6 +1447,12 @@ def main() -> None:
     log0(" ".join(f"{a}={getattr(args,a)}" for a in sorted(dir(args)) if not a.startswith("_") and a not in ("train_files","val_files") and not callable(getattr(args,a))), console=False)
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"params:{n_params} L:{args.num_layers} d:{args.model_dim} h:{args.num_heads} kv:{args.num_kv_heads} ws:{world_size} ga:{grad_accum_steps} s:{args.seed}")
+    # Set global quantization mode.
+    global _QUANT_MODE, _INT6_CLIP_Q, _INT6_ACTIVE
+    _QUANT_MODE = args.quant_mode
+    _INT6_CLIP_Q = args.int6_clip_q
+    _INT6_ACTIVE = (args.late_qat_frac <= 0.0)  # if no late QAT, always active
+    log0(f"quant_mode:{args.quant_mode}")
     if args.n_channels > 1:
         log0(f"superposition: channels:{args.n_channels} p_causal:{args.p_causal} mask:[{args.mask_rate_min},{args.mask_rate_max}]")
     if args.local_conv_layers > 0:
@@ -1442,6 +1545,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Late QAT: activate int6 STE after a fraction of training.
+        if args.quant_mode == "int6" and args.late_qat_frac > 0:
+            _INT6_ACTIVE = (scale < args.late_qat_frac)
 
         # Sequence length schedule
         if args.seq_len_start > 0 and not _seq_switched:
@@ -1544,42 +1651,53 @@ def main() -> None:
                 stop_after_step = step
 
     # --- Serialization ---
+    model_file = "final_model.ptz"
     if master_process:
-        # Use EMA weights if available, otherwise current weights.
         if ema_state is not None:
             log0("using EMA weights for serialization")
             sd = ema_state
         else:
             sd = base_model.state_dict()
-        # Strip training-only params.
         sd = {k: v for k, v in sd.items() if not k.startswith("channel_") or k in ("channel_in", "channel_out")}
         if base_model.tie_embeddings or args.logit_head_type == "tversky":
             sd.pop("lm_head.weight", None)
 
-        # Compute ternary overrides for no-features Tversky prototypes
-        ternary_overrides = set()
-        for n, m in base_model.named_modules():
-            if isinstance(m, TverskyProjection) and m.no_features_mode:
-                ternary_overrides.add(n + ".prototypes")
-        ternary_overrides = ternary_overrides or None
-
-        # Two methods: Standard Base-3 vs Bitmask Mapping
-        methods = {}
-        for method in ("standard", "bitmask"):
-            q_obj, stats = q_sd(sd, group_size=args.bitnet_group_size, fp_storage=args.fp_storage, ternary_method=method, ternary_override_names=ternary_overrides)
+        if args.quant_mode == "int6":
+            # Int6 serialization: int6 for block weights, int8 for embeddings, fp16 for small.
+            q_obj, q_stats = q_sd_int6(sd, clip_q=args.int6_clip_q)
             buf = io.BytesIO()
             torch.save(q_obj, buf)
-            methods[method] = {"blob": lzma.compress(buf.getvalue(), preset=9), "stats": stats}
-        best = min(methods, key=lambda m: len(methods[m]["blob"]))
-        final_blob, q_stats = methods[best]["blob"], methods[best]["stats"]
-        with open("final_model.ternary.ptz", "wb") as f:
-            f.write(final_blob)
+            try:
+                import zstandard
+                final_blob = zstandard.ZstdCompressor(level=22).compress(buf.getvalue())
+                compress_name = "zstd-22"
+            except ImportError:
+                final_blob = lzma.compress(buf.getvalue(), preset=9)
+                compress_name = "lzma-9"
+            log0(f"int6 serialization ({compress_name}): int6:{q_stats['int6_params']} int8:{q_stats['int8_params']} fp:{q_stats['fp_params']}")
+        else:
+            # Ternary serialization: base-3 packing + LZMA.
+            ternary_overrides = set()
+            for n, m in base_model.named_modules():
+                if isinstance(m, TverskyProjection) and m.no_features_mode:
+                    ternary_overrides.add(n + ".prototypes")
+            ternary_overrides = ternary_overrides or None
+            methods = {}
+            for method in ("standard", "bitmask"):
+                q_obj, stats = q_sd(sd, group_size=args.bitnet_group_size, fp_storage=args.fp_storage, ternary_method=method, ternary_override_names=ternary_overrides)
+                buf = io.BytesIO()
+                torch.save(q_obj, buf)
+                methods[method] = {"blob": lzma.compress(buf.getvalue(), preset=9), "stats": stats}
+            best = min(methods, key=lambda m: len(methods[m]["blob"]))
+            final_blob, q_stats = methods[best]["blob"], methods[best]["stats"]
+            log0(f"ternary serialization: ternary:{q_stats['ternary_params']}({q_stats['ternary_bytes']}B) fp:{q_stats['fp_params']}({q_stats['fp_bytes']}B)")
 
+        with open(model_file, "wb") as f:
+            f.write(final_blob)
         artifact_bytes = len(final_blob)
         code_bytes = len(code.encode("utf-8"))
-
         total = artifact_bytes + code_bytes
-        log0(f"artifact:{artifact_bytes/1e6:.2f}MB ternary:{q_stats['ternary_params']}({q_stats['ternary_bytes']}B) fp:{q_stats['fp_params']}({q_stats['fp_bytes']}B) code:{code_bytes}")
+        log0(f"artifact:{artifact_bytes/1e6:.2f}MB code:{code_bytes}")
         log0(f"budget:{total}/{16000000} ({total/1e6:.2f}/{16.00:.2f}MB) {'FITS' if total <= 16000000 else 'OVER'}")
 
         if args.eval_depth_recurrence > 0:
@@ -1590,14 +1708,24 @@ def main() -> None:
     if distributed:
         dist.barrier()
 
-    with open("final_model.ternary.ptz", "rb") as f:
-        loaded = torch.load(io.BytesIO(lzma.decompress(f.read())), map_location="cpu", weights_only=False)
-    base_model.load_state_dict(deq_sd(loaded), strict=False)
+    with open(model_file, "rb") as f:
+        raw = f.read()
+    try:
+        decompressed = lzma.decompress(raw)
+    except Exception:
+        import zstandard
+        decompressed = zstandard.ZstdDecompressor().decompress(raw)
+    loaded = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
+
+    if args.quant_mode == "int6":
+        base_model.load_state_dict(deq_sd_int6(loaded), strict=False)
+    else:
+        base_model.load_state_dict(deq_sd(loaded), strict=False)
     torch._dynamo.reset()
 
     q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
                                      val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-    log0(f"final_ternary_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f}")
+    log0(f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f}")
 
     opt_temp = 1.0
     if args.temp_scaling:
