@@ -168,6 +168,7 @@ class Hyperparameters:
     clb_rank = _e("CLB_RANK", 8, int)
     # Quantization mode: "ternary" (1.85 bits, ~66M params) or "int6" (6 bits, ~22M params)
     quant_mode = _e("QUANT_MODE", "ternary")
+    quant_scheme = _e("QUANT_SCHEME", "")  # "lloyd_max_int4", "lloyd_max_int5", etc. Empty = use quant_mode default
     int6_clip_q = _e("INT6_CLIP_Q", 0.9999984, float)
     late_qat_frac = _e("LATE_QAT_FRAC", 0.0, float)  # fraction of training to start int6 STE (0=always on)
     # EMA disabled by default — causes roundtrip gap with ternary quantization.
@@ -309,6 +310,73 @@ def deq_sd_int6(obj: dict, target_dtype=torch.bfloat16) -> dict:
     for key, val in obj.items():
         name = key.removesuffix(".q").removesuffix(".s").removesuffix(".shape")
         if name not in processed and not key.endswith((".q", ".s", ".shape")):
+            out[key] = val.to(target_dtype).contiguous()
+    return out
+
+# --- Lloyd-Max quantization (Gaussian-optimal) ---
+def q_sd_lloyd_max(state_dict: dict, n_levels: int = 15) -> tuple[dict, dict]:
+    """Quantize state dict using Lloyd-Max (Gaussian-optimal) quantization.
+    Stores per-row sigma + int codes. Artifact includes n_levels for dequant LUT selection.
+    """
+    lut = torch.tensor(_compute_lloyd_max_lut(n_levels), dtype=torch.float32)
+    half = n_levels // 2
+    result = {"_lloyd_max_levels": torch.tensor(n_levels)}
+    stats = {"lm_params": 0, "int8_params": 0, "fp_params": 0}
+    for name, tensor in state_dict.items():
+        if "mtp_heads" in name:
+            continue
+        t = tensor.detach().cpu().float().contiguous()
+        is_keep_float = any(p in name for p in INT6_KEEP_FLOAT_PATTERNS)
+        if t.ndim >= 2 and t.numel() > 4096 and not is_keep_float:
+            t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
+            sigma = t2d.std(dim=1).clamp_min(1e-8)
+            normalized = t2d / sigma[:, None]
+            diffs = (normalized.unsqueeze(-1) - lut.unsqueeze(0).unsqueeze(0)).abs()
+            codes = (diffs.argmin(dim=-1) - half).to(torch.int8)
+            result[name + ".q"] = codes.contiguous()
+            result[name + ".s"] = sigma.half().contiguous()
+            result[name + ".shape"] = torch.tensor(list(t.shape))
+            stats["lm_params"] += t.numel()
+        elif t.ndim >= 2 and t.numel() > 4096 and is_keep_float:
+            # Int8 per-row for embeddings (same as int6 path)
+            t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
+            q, s = quantize_int6(t2d, INT8_RANGE)
+            result[name + ".q"] = q
+            result[name + ".s"] = s
+            result[name + ".shape"] = torch.tensor(list(t.shape))
+            stats["int8_params"] += t.numel()
+        else:
+            result[name] = t.half()
+            stats["fp_params"] += t.numel()
+    return result, stats
+
+def deq_sd_lloyd_max(obj: dict, target_dtype=torch.bfloat16) -> dict:
+    """Reconstruct state dict from Lloyd-Max quantized representation."""
+    n_levels = int(obj.get("_lloyd_max_levels", torch.tensor(15)).item())
+    lut = torch.tensor(_compute_lloyd_max_lut(n_levels), dtype=torch.float32)
+    half = n_levels // 2
+    out = {}
+    processed = set()
+    for key in list(obj.keys()):
+        if key.endswith(".q"):
+            name = key[:-2]
+            processed.add(name)
+            q = obj[name + ".q"]
+            s = obj[name + ".s"].float()
+            shape = obj[name + ".shape"].tolist()
+            is_keep_float = any(p in name for p in INT6_KEEP_FLOAT_PATTERNS)
+            if is_keep_float:
+                # Int8 uniform dequant for embeddings
+                t = (q.float() * s[:, None]).to(target_dtype) if s.ndim > 0 else (q.float() * s).to(target_dtype)
+            else:
+                # Lloyd-Max dequant: w = sigma * LUT[code + half]
+                indices = (q.long() + half).clamp(0, n_levels - 1)
+                recon = lut[indices]
+                t = (recon * s[:, None]).to(target_dtype)
+            out[name] = t.reshape(shape).contiguous()
+    for key, val in obj.items():
+        name = key.removesuffix(".q").removesuffix(".s").removesuffix(".shape")
+        if name not in processed and not key.endswith((".q", ".s", ".shape")) and key != "_lloyd_max_levels":
             out[key] = val.to(target_dtype).contiguous()
     return out
 
@@ -1058,7 +1126,34 @@ class QATEmbedding(nn.Embedding):
 _QUANT_MODE = "ternary"
 _INT6_CLIP_Q = 0.9999984
 _INT6_ACTIVE = True  # toggled by late QAT schedule
-_STE_ENABLED = True  # set STE_ENABLED=0 to disable (e.g., for Lloyd-Max quantization)
+_STE_ENABLED = True  # set STE_ENABLED=0 to disable
+_STE_TYPE = "uniform"  # "uniform" (current int6) or "lloyd_max" (Gaussian-optimal)
+
+# Lloyd-Max LUT for Gaussian-optimal quantization (precomputed for N(0,1))
+_LLOYD_MAX_LUT_CACHE: dict[int, Tensor] = {}
+
+def _compute_lloyd_max_lut(n_levels: int) -> list[float]:
+    """Compute optimal Lloyd-Max centroids for N(0,1) with n_levels."""
+    import math as _m
+    pdf = lambda x: _m.exp(-0.5*x*x) / _m.sqrt(2*_m.pi)
+    cdf = lambda x: 0.5 * (1 + _m.erf(x / _m.sqrt(2)))
+    INF = 10.0
+    b = [-INF] + [-4.0 + 8.0*i/n_levels for i in range(1, n_levels)] + [INF]
+    c = [0.0] * n_levels
+    for _ in range(200):
+        for i in range(n_levels):
+            pl, ph = cdf(b[i]), cdf(b[i+1])
+            c[i] = (pdf(b[i]) - pdf(b[i+1])) / (ph - pl) if ph - pl > 1e-15 else (b[i]+b[i+1])/2
+        for i in range(1, n_levels):
+            b[i] = (c[i-1] + c[i]) / 2
+    return c
+
+def get_lloyd_max_lut(n_levels: int, device) -> Tensor:
+    """Get cached Lloyd-Max LUT as tensor."""
+    if n_levels not in _LLOYD_MAX_LUT_CACHE or _LLOYD_MAX_LUT_CACHE[n_levels].device != device:
+        _LLOYD_MAX_LUT_CACHE[n_levels] = torch.tensor(
+            _compute_lloyd_max_lut(n_levels), dtype=torch.float32, device=device)
+    return _LLOYD_MAX_LUT_CACHE[n_levels]
 
 class QuantizedLinear(nn.Linear):
     """Quantized linear layer. Supports ternary ({-1,0,1}) or int6 ([-31,31]) STE."""
@@ -1069,14 +1164,26 @@ class QuantizedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if _QUANT_MODE == "int6" and self.training and _INT6_ACTIVE and _STE_ENABLED:
-            # Int6 STE: fake quantize to [-31, 31] per row.
-            with torch.no_grad():
-                w32 = w.float()
-                clip_abs = torch.quantile(w32.abs(), _INT6_CLIP_Q, dim=1).clamp_min(1e-8)
-                scale = clip_abs / 31.0
-                w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
-                w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
-            w = w.to(x.dtype) + (w_q - w.to(x.dtype)).detach()
+            if _STE_TYPE == "lloyd_max":
+                # Lloyd-Max STE: snap to nearest Gaussian-optimal centroid.
+                with torch.no_grad():
+                    w32 = w.float()
+                    sigma = w32.std(dim=1).clamp_min(1e-8)
+                    normalized = w32 / sigma[:, None]
+                    lut = get_lloyd_max_lut(15, w.device)  # int4 = 15 levels
+                    diffs = (normalized.unsqueeze(-1) - lut.unsqueeze(0).unsqueeze(0)).abs()
+                    nearest = lut[diffs.argmin(dim=-1)]
+                    w_q = (nearest * sigma[:, None]).to(x.dtype)
+                w = w.to(x.dtype) + (w_q - w.to(x.dtype)).detach()
+            else:
+                # Uniform int6 STE: fake quantize to [-31, 31] per row.
+                with torch.no_grad():
+                    w32 = w.float()
+                    clip_abs = torch.quantile(w32.abs(), _INT6_CLIP_Q, dim=1).clamp_min(1e-8)
+                    scale = clip_abs / 31.0
+                    w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
+                    w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
+                w = w.to(x.dtype) + (w_q - w.to(x.dtype)).detach()
         elif _QUANT_MODE == "ternary" and _STE_ENABLED:
             # Ternary STE: fake quantize to {-1, 0, 1} per group.
             w = w.bfloat16()
@@ -2208,6 +2315,15 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
     if base_model.lm_head is not None and (args.tie_embeddings or args.logit_head_type == "tversky"):
         base_model.lm_head.weight.requires_grad_(False)
 
+    # Load pre-trained weights for resume/fine-tuning.
+    load_weights_path = os.environ.get("LOAD_WEIGHTS", "")
+    if load_weights_path:
+        ckpt = torch.load(load_weights_path, map_location="cpu", weights_only=False)
+        model_sd = base_model.state_dict()
+        loaded = {k: v.to(dtype=model_sd[k].dtype) for k, v in ckpt.items() if k in model_sd}
+        base_model.load_state_dict(loaded, strict=False)
+        log0(f"loaded weights from {load_weights_path} ({len(loaded)}/{len(model_sd)} keys)")
+
     torch._dynamo.config.optimize_ddp = False
 
     if args.compile_mode == "off":
@@ -2264,12 +2380,13 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"params:{n_params} L:{args.num_layers} d:{args.model_dim} h:{args.num_heads} kv:{args.num_kv_heads} ws:{world_size} ga:{grad_accum_steps} s:{args.seed}")
     # Set global quantization mode.
-    global _QUANT_MODE, _INT6_CLIP_Q, _INT6_ACTIVE, _STE_ENABLED
+    global _QUANT_MODE, _INT6_CLIP_Q, _INT6_ACTIVE, _STE_ENABLED, _STE_TYPE
     _QUANT_MODE = args.quant_mode
     _INT6_CLIP_Q = args.int6_clip_q
     _INT6_ACTIVE = (args.late_qat_frac <= 0.0)  # if no late QAT, always active
     _STE_ENABLED = os.environ.get("STE_ENABLED", "1") != "0"
-    log0(f"quant_mode:{args.quant_mode} ste:{_STE_ENABLED}")
+    _STE_TYPE = os.environ.get("STE_TYPE", "uniform")  # "uniform" or "lloyd_max"
+    log0(f"quant_mode:{args.quant_mode} ste:{_STE_ENABLED} ste_type:{_STE_TYPE}")
     if args.n_channels > 1:
         log0(f"superposition: channels:{args.n_channels} p_causal:{args.p_causal} mask:[{args.mask_rate_min},{args.mask_rate_max}]")
     if args.local_conv_layers > 0:
@@ -2601,7 +2718,23 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
             torch.save({k: v.cpu().float() for k, v in sd.items()}, float_file)
             log0(f"saved float weights: {float_file} ({os.path.getsize(float_file)/1e6:.1f}MB)")
 
-        if args.quant_mode == "int6":
+        if args.quant_scheme.startswith("lloyd_max"):
+            # Lloyd-Max serialization: Gaussian-optimal quantization
+            n_levels = {"lloyd_max_int3": 7, "lloyd_max_int4": 15, "lloyd_max_int5": 31,
+                        "lloyd_max": 63}.get(args.quant_scheme, 15)
+            q_obj, q_stats = q_sd_lloyd_max(sd, n_levels=n_levels)
+            buf = io.BytesIO()
+            torch.save(q_obj, buf)
+            try:
+                import zstandard
+                final_blob = zstandard.ZstdCompressor(level=22).compress(buf.getvalue())
+                compress_name = "zstd-22"
+            except ImportError:
+                final_blob = lzma.compress(buf.getvalue(), preset=9)
+                compress_name = "lzma-9"
+            log0(f"lloyd_max serialization ({compress_name}, {n_levels} levels): "
+                 f"lm:{q_stats['lm_params']} int8:{q_stats['int8_params']} fp:{q_stats['fp_params']}")
+        elif args.quant_mode == "int6":
             # Int6 serialization: int6 for block weights, int8 for embeddings, fp16 for small.
             q_obj, q_stats = q_sd_int6(sd, clip_q=args.int6_clip_q)
             buf = io.BytesIO()
@@ -2711,7 +2844,9 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
             log0(f"loaded bigram table from artifact, gate={bigram_data['gate'].item():.4f}")
         loaded = model_data
 
-    if args.quant_mode == "int6":
+    if args.quant_scheme.startswith("lloyd_max"):
+        base_model.load_state_dict(deq_sd_lloyd_max(loaded), strict=False)
+    elif args.quant_mode == "int6":
         base_model.load_state_dict(deq_sd_int6(loaded), strict=False)
     else:
         base_model.load_state_dict(deq_sd(loaded), strict=False)
@@ -2754,7 +2889,9 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
             if isinstance(m, nn.Linear):
                 m.float()
         restore_low_dim_params_to_fp32(model2)
-        if args.quant_mode == "int6":
+        if args.quant_scheme.startswith("lloyd_max"):
+            model2.load_state_dict(deq_sd_lloyd_max(loaded2), strict=False)
+        elif args.quant_mode == "int6":
             model2.load_state_dict(deq_sd_int6(loaded2), strict=False)
         else:
             model2.load_state_dict(deq_sd(loaded2), strict=False)

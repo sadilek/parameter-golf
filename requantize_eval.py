@@ -418,9 +418,12 @@ def roundtrip_eval(sd, method, args, model, device, val_tokens, bl, hl, il):
         blob = lzma.compress(buf.getvalue(), preset=9)
     artifact_bytes = len(blob)
 
-    # Dequantize and load
-    recon_sd = dequantize_sd(q_obj, method=method)
-    model.load_state_dict(recon_sd, strict=False)
+    # Dequantize and load with proper dtype matching
+    recon_sd = dequantize_sd(q_obj, method=method, target_dtype=torch.float32)
+    model_sd = model.state_dict()
+    converted = {k: v.to(device=device, dtype=model_sd[k].dtype)
+                 for k, v in recon_sd.items() if k in model_sd}
+    model.load_state_dict(converted, strict=False)
 
     # Eval
     val_loss, val_bpb = eval_val(args, model, 0, 1, device, 1, val_tokens, bl, hl, il)
@@ -522,7 +525,9 @@ def main():
     bl, hl, il = build_luts(sp, args.vocab_size, device)
     val_tokens = ld_val(args.val_files, args.train_seq_len)
 
-    # Build model
+    # Build model (match training script's mixed precision setup)
+    import torch.nn as nn
+    from train_combined import QuantizedLinear, LowRankLinear, restore_low_dim_params_to_fp32
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -534,18 +539,39 @@ def main():
         sse_entropy_bins=args.sse_entropy_bins,
         ut_unique_blocks=args.ut_unique_blocks, ut_iters=args.ut_iters,
     ).to(device).bfloat16()
+    # Match training script: linear layers in float32
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, QuantizedLinear, LowRankLinear)):
+            m.float()
+    restore_low_dim_params_to_fp32(model)
+    if model.lm_head is not None and args.tie_embeddings:
+        model.lm_head.weight.requires_grad_(False)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model: {n_params:,} params, {args.num_layers}L/{args.model_dim}d")
+
+    def load_weights(state_dict):
+        """Load state dict with proper dtype handling."""
+        converted = {}
+        model_sd = model.state_dict()
+        for k, v in state_dict.items():
+            if k in model_sd:
+                converted[k] = v.to(device=device, dtype=model_sd[k].dtype)
+        model.load_state_dict(converted, strict=False)
+
+    # Pre-quant eval (sanity check — should match training's val_bpb)
+    load_weights(sd)
+    prequant_loss, prequant_bpb = eval_val(args, model, 0, 1, device, 1,
+                                            val_tokens, bl, hl, il)
+    print(f"\n  Pre-quant: {prequant_bpb:.4f} BPB (should match training val_bpb)")
 
     results = {}
     for method in args_cli.methods:
         print(f"\n  Method: {method}")
-        # Reload float weights each time (quantize modifies nothing, but be safe)
-        model.load_state_dict({k: v.to(device).bfloat16() for k, v in sd.items()}, strict=False)
-
         bpb, art_bytes, stats = roundtrip_eval(
             sd, method, args, model, device, val_tokens, bl, hl, il)
         results[method] = {"bpb": bpb, "artifact_mb": art_bytes / 1e6}
-        print(f"    BPB: {bpb:.4f}  artifact: {art_bytes/1e6:.2f}MB  "
-              f"int6:{stats['int6_params']} int8:{stats['int8_params']} fp:{stats['fp_params']}")
+        gap = bpb - prequant_bpb
+        print(f"    BPB: {bpb:.4f}  gap: {gap:+.4f}  artifact: {art_bytes/1e6:.2f}MB")
 
     # Summary
     print(f"\n{'='*60}")
