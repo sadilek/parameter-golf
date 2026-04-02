@@ -7,13 +7,14 @@
 
 ## Current Best Results
 
-| Config | BPB (roundtrip) | Artifact | Steps | GPU | Notes |
-|--------|----------------|----------|-------|-----|-------|
-| **Full stack single** (13L+XSA-all+SSE+1cycle+seq2048) | **1.3575** | 14.05MB FITS | 500 | 1×A100 | Best budget-fit single model |
-| Full stack 1000 steps | **1.2901** (pre-quant) | — | 1000 | 1×H100 | 🔬 Running to 2000 |
-| 2×7L ensemble + SSE | 1.4057 | 15.5MB FITS | 500 | 1×A100 | Best budget-fit ensemble |
-| 4×7L ensemble | 1.3880 | ~30MB OVER | 500 | 1×A100 | Best ensemble absolute (500 steps) |
-| 2×7L ensemble | **1.2778** | 21.6MB OVER | 2000 | 1×A100 | Best absolute ever |
+| Config | BPB (pre-quant) | BPB (roundtrip) | Artifact | Steps | GPU | Quant |
+|--------|----------------|-----------------|----------|-------|-----|-------|
+| **13L DDP 10min** | **1.1708** | **1.2181** | 16.1MB | 4170 | 8×H100 | Lloyd-Max int4 |
+| 13L DDP uncapped | 1.1870 | 1.2267 | 15.8MB | 3000 | 8×H100 | Lloyd-Max int4 |
+| 13L resumed 4000 | 1.1999 | 1.2440 | 16.0MB | 4000 | 1×A100 | Lloyd-Max int4 |
+| 13L 2000 steps | 1.2247 | 1.2593 | 15.9MB | 2000 | 1×A100 | Lloyd-Max int4 |
+| 13L uniform int6 | 1.2247 | 1.2302 | 19.3MB OVER | 2000 | 1×A100 | Uniform int6 |
+| Leaderboard SOTA | — | **1.1147** | 15.9MB | ~7000 | 8×H100 | GPTQ int6 |
 
 ---
 
@@ -156,9 +157,8 @@
 - Our implementation crashes — register_buffer + float() interaction bug
 - **Worth fixing**: Would enable even more aggressive compression
 
-### Codebook / Non-Uniform Quantization 💡 Untested | **Novel**
+### Codebook / Non-Uniform Quantization 🔬 Tested | **Novel**
 - **Current int6**: uniform per-row scaling. `w_recon = q * scale` — evenly spaced values.
-- **Nobody in competition does this** — all use uniform per-row scaling.
 
 **Approach 1: Per-matrix codebook** (original idea)
 - Store per-matrix codebook of 63 float16 centroids (Lloyd-Max / k-means on trained weights).
@@ -197,7 +197,26 @@
 - `centroid(q) = σ · (φ(b_lo) - φ(b_hi)) / (Φ(b_hi) - Φ(b_lo))` where φ=PDF, Φ=CDF, boundaries=midpoints of adjacent centroids.
 - With σ-regularization (approach 3), even σ is a constant → **zero stored params, zero artifact cost**. Just math in the eval code.
 
-**Next step**: Train with σ-regularization on MLX smoke test, capture pre-quantization float weights, compare uniform vs Lloyd-Max roundtrip BPB gap.
+**Tested results (13L, 1000 steps no STE, requantized offline):**
+
+| Method | BPB | Artifact | RT gap |
+|--------|-----|----------|--------|
+| uniform int6 | 1.817 | 23.2MB OVER | +0.009 |
+| uniform int5 | 1.844 | 18.8MB OVER | +0.019 |
+| uniform int4 | 2.006 | 13.4MB FITS | +0.181 |
+| uniform int3 | 3.047 | 7.9MB FITS | +1.722 |
+| **lloyd_max int6** | **1.815** | 26.1MB OVER | +0.002 |
+| **lloyd_max int5** | **1.822** | 24.0MB OVER | +0.005 |
+| **lloyd_max int4** | **1.850** | 19.6MB OVER | +0.025 |
+| **lloyd_max int3** | **2.002** | 14.1MB FITS | +0.177 |
+
+- Lloyd-Max int3 (2.002) beats uniform int4 (2.006) at similar artifact size
+- Lloyd-Max degrades gracefully: int6→int3 costs +0.19 BPB. Uniform: +1.23 BPB
+- **Key trade-off**: Lloyd-Max codes are max entropy → incompressible → larger per-param artifact, but stable across training steps
+- **STE makes uniform artifacts LARGER** (+0.34MB, tested A/B): STE pushes weights toward uniform distribution → higher code entropy
+- For competition: Lloyd-Max int4 enables >4000 steps where uniform int6 overflows at ~2000 steps
+
+**Key insight**: MSE is the wrong objective. GPTQ (used by SOTA) achieves +0.002 gap by considering weight importance via Hessian, not just per-weight MSE.
 
 ### Federated UT Ensemble 🔬 Tested (single GPU) | **Novel**
 - K low-rank UTs sharing one embedding, trained with batch splitting
@@ -249,10 +268,11 @@
 
 ## GPU & Infrastructure
 
-### GPU Benchmarks (full stack: 13L XSA-all SSE 1cycle seq2048 batch786K)
-- A100 SXM4 80GB: 1950ms/step (compiled)
+### GPU Benchmarks (full stack: 13L XSA-all SSE seq2048 batch786K)
+- A100 SXM4 80GB: 1930ms/step (compiled, 1 GPU)
 - H100 NVL 96GB: 1592ms/step (compiled, 18% faster)
-- Estimated 8×H100 SXM: ~200ms/step → ~3000 steps in 600s
+- **8×H100 SXM DDP**: 144ms/step → **4170 steps in 600s** (tested!)
+- 8×H100 SXM Federated: 128ms/step → 4710 steps in 600s (but worse BPB)
 
 ### GPU Utilization
 - **With compile**: 100% GPU compute utilization — no room for parallel work
@@ -271,29 +291,77 @@
 
 ---
 
-## Wild Ideas Explored
+## 8×H100 Results
 
-### Random Seed Weight Search ❌
-- Tested 20 seeds for untrained models: all give 4.178 ± 0.003 BPB
-- No magic seeds — model needs training regardless of init
+### DDP vs Federated (10-min wallclock, 13L full stack, Lloyd-Max int4)
 
-### Fractal/Structured Weight Generation 🤔 Unexplored
-- Tiny deterministic program generates weight structure, store only corrections
-- Could compress beyond int6 if structure captures weight patterns
+| | DDP | Federated (avg every 50) |
+|---|---|---|
+| Steps completed | 4170 | 4710 |
+| Step time | 144ms | 128ms |
+| **Pre-quant BPB** | **1.1708** | 1.2637 |
+| **Roundtrip BPB** | **1.2181** | 1.3272 |
 
-### Growing Model at Eval Time 💡
-- Legal: artifact is 16MB, but eval code can create larger model
-- Add LoRA adapters at eval → TTT trains them on 62M val tokens
-- Spawn N copies with different LoRA → ensemble at eval → no extra artifact cost
+- **DDP wins decisively** — gradient averaging quality > data diversity from independent training
+- DDP pre-quant (1.171) is only 0.052 from leaderboard SOTA (1.119)
+
+### 7L Scaling (for ensemble analysis)
+- 7L at 6000 steps: 1.238 BPB pre-quant, 1.343 roundtrip (gap +0.105)
+- Smaller models are 3× more fragile to quantization than 13L
+- 2×7L ensemble doesn't beat single 13L
 
 ---
 
-## Priority Stack for Next Session
+## Wild Ideas Explored
 
-1. **Test federated UT ensemble** 💡 — `train_fed_ut_ensemble.py` on A100. K=5, r128, 3×4 UT, 500 steps.
-2. **Codebook quantization** 💡 — Per-matrix Lloyd-Max centroids. Should reduce roundtrip gap for ~25KB.
-3. **TTT implementation** 💡 — #1 eval technique. 62M val tokens = ample data. Per-document LoRA.
-4. **8×H100 deployment** — Run federated UT ensemble at scale. Fix NCCL if needed.
-5. **Sliding window eval** 💡 — stride=64, used by SOTA, free +0.005 BPB
-6. **Trim code for submission** — Remove unused features to shrink code size in artifact
-7. **Fix LoRA crash** — For frozen-base compression experiments
+### Frequency-Domain Weight Compression ❌ No structure | **Novel**
+- DCT analysis of all weight matrices: energy is perfectly flat (10% coefficients = 10.1% energy)
+- Weight matrices are white noise in frequency domain — zero spatial correlation
+- **Script**: `freq_compress.py`
+
+### Stochastic Quantization Ensemble ❌ Marginal/harmful | **Novel**
+- N forward passes with random rounding, average logits
+
+| Method | N=1 | N=5 | N=10 |
+|--------|-----|-----|------|
+| uniform int6 | 1.817 | 1.812 | 1.812 |
+| lloyd_max int4 | 1.850 | 1.857 | 1.853 |
+| lloyd_max int3 | 2.002 | 2.098 | 2.082 |
+
+- Uniform: -0.005 (stochastic removes bias). Lloyd-Max: HURTS (centroids already optimal)
+- **Script**: `stochastic_eval.py`
+
+### STE Effect on Artifact Size ❌ Makes it WORSE | **Novel finding**
+- A/B: STE on → artifact 23.54MB vs STE off → 23.20MB (+0.34MB)
+- STE pushes weights toward uniform distribution → higher code entropy → worse compression
+
+### Weight Palette 💡 Untested | **Novel**
+- 256 learned float16 values (512 bytes) as codebook, 8-bit index per weight
+- Jointly optimized with model — adapts to actual weight needs, not assumed distribution
+
+### Differentiable Codebook 💡 Untested | **Novel**
+- Learnable codebook entries via Gumbel-softmax or straight-through
+- Codebook co-evolves with weights during training
+
+---
+
+## Leaderboard SOTA Analysis (PR #1019, 1.1147 BPB)
+
+Key techniques from @abaybektursun:
+- **GPTQ (Full Hessian)**: +0.002 gap. AR self-generated calibration data
+- **11L, MLP 3×**: ~7000 steps at 86ms/step
+- **XSA all layers, BigramHash 3072×112, Late QAT, EMA+SWA**
+- **Sliding window eval**: stride 64, free -0.025 to -0.035 BPB
+- Blog: https://abay.tech/posts/pr-1019-model-autopsy
+- MLP needs 7-8 bits, attention survives at 4-5 bits (stable rank predicts sensitivity)
+
+---
+
+## Priority Stack
+
+1. **Weight palette** 💡 — Learned 256-entry codebook, jointly trained
+2. **Differentiable codebook** 💡 — End-to-end learnable quantization
+3. **GPTQ** — Closes 80% of roundtrip gap (+0.047 → ~+0.005)
+4. **Sliding window eval** — Free -0.025 BPB
+5. **MLP 3× + 11L** — Match SOTA architecture
+6. **Trim code** — 150KB train_combined.py wastes artifact budget
