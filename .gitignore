@@ -10,4 +10,7 @@ data/docs_selected.jsonl
 .venv
 logs/
 *.png
+*.ptz
 .mcp.json
+saved_weights/
+data/ngram_tables.pt
