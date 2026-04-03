@@ -77,3 +77,12 @@ GPT-style transformer with:
 - Evaluation must also complete within 10 minutes on 8xH100s (separate from training time)
 - Cannot access validation data during training
 - Submission scripts must be self-contained and run from within their records folder
+
+## Experiment Workflow Rules
+
+- **Always copy results back to local machine.** After any GPU experiment, download float weights, logs, and artifacts to `saved_weights/` before stopping the pod. Pod volumes can be lost if pods are deleted.
+- **Stop pods immediately** after experiments finish. Never leave pods idle.
+- **Use shell script files** for nohup commands (not inline bash -c) to avoid env var escaping issues.
+- **Use PYTHONUNBUFFERED=1** or `python -u` when redirecting output via nohup.
+- **Use grad_accum>=8** for eval_val on 13L+ models — smaller batches cause silent OOM and wrong BPB.
+- **Track all experiments** in `hypotheses.md` with results, not just plans.

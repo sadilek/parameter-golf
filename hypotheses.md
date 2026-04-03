@@ -312,6 +312,55 @@
 
 ---
 
+## GPTQ Implementation ✅ | Known (our implementation novel)
+
+Implemented full Hessian GPTQ with Cholesky-based error compensation. **Script**: `gptq_quantize.py`
+
+**Results on 13L competition-config weights (1.2278 BPB pre-quant, 2000 steps, 1cycle+XSA+SSE):**
+
+| Scheme | Bits per layer | BPB | Gap | Raw size |
+|--------|---------------|-----|-----|----------|
+| **GPTQ uniform int6** | 6,6,6,...,6 | **1.2295** | **+0.002** | 23.6MB |
+| GPTQ 6,6,4,4,...,5 | mixed conservative | 1.2503 | +0.022 | 17.4MB |
+| GPTQ 6,5,3,3,...,4 | mixed aggressive | 1.3993 | +0.172 | 13.9MB |
+| GPTQ sensitivity-guided | 6,5,4,4,3,...,4 | 1.3370 | +0.109 | 14.8MB |
+
+- **GPTQ uniform int6 is nearly lossless** (+0.002 gap on competition weights!)
+- Mixed precision with int3 still hurts (+0.17) — 7 levels can't represent weights even with error compensation
+- Conservative mixed (6,6,4,4,...,5) trades +0.022 BPB for 6.2MB artifact savings
+- Calibration: 131K tokens from validation set (SOTA uses AR self-generated; both work)
+
+### Per-Matrix Sensitivity Map ✅ | **Novel**
+
+**Script**: `sensitivity_map.py` — quantize one matrix at a time to int3, measure BPB impact.
+
+**Block 0 accounts for 56% of total quantization damage:**
+- blocks.0.attn.c_qkv: +0.737 BPB (24%) — most sensitive single matrix
+- blocks.0.mlp.proj: +0.634 BPB (20%)
+- blocks.0.mlp.gate_up: +0.214 BPB (7%)
+- blocks.0.attn.proj: +0.164 BPB (5%)
+- Block 1: ~10% total
+- Blocks 3-12: <0.02 BPB each — **nearly insensitive**
+- Last 2 blocks: slightly elevated (~0.005-0.008 each) — U-shaped sensitivity
+
+**Key insight**: middle layers barely affect output when quantized → potential for extreme compression there. But GPTQ can't fully compensate int3 errors even in insensitive layers.
+
+### Mixed-Precision Ternary Training ❌ Diverges | **Novel**
+
+Trained with ternary STE on blocks 2-10, int6 STE on blocks 0-1 and 11-12. Per-layer `ste_override` attribute on QuantizedLinear.
+
+| Step | Mixed ternary | Standard (same config) |
+|------|-------------|----------------------|
+| 500 | 1.584 | 1.416 |
+| 1000 | 1.596 | 1.306 |
+| 2000 | **1.647 (diverging!)** | **1.228** |
+
+- Model gets WORSE after step 500 — ternary STE destabilizes joint optimization
+- The ternary and non-ternary blocks fight each other during training
+- Float weights saved: `saved_weights/float/13L_mixed_ternary_2000step_float.pt`
+
+---
+
 ## Wild Ideas Explored
 
 ### Frequency-Domain Weight Compression ❌ No structure | **Novel**
@@ -335,13 +384,98 @@
 - A/B: STE on → artifact 23.54MB vs STE off → 23.20MB (+0.34MB)
 - STE pushes weights toward uniform distribution → higher code entropy → worse compression
 
-### Weight Palette 💡 Untested | **Novel**
-- 256 learned float16 values (512 bytes) as codebook, 8-bit index per weight
-- Jointly optimized with model — adapts to actual weight needs, not assumed distribution
+### Weight Palette 🔬 Tested (offline) | **Novel**
+- Per-matrix k-means codebook. **Script**: `palette_compress.py`
 
-### Differentiable Codebook 💡 Untested | **Novel**
-- Learnable codebook entries via Gumbel-softmax or straight-through
-- Codebook co-evolves with weights during training
+| K (entries) | Bits | MSE | Artifact | Budget |
+|-------------|------|-----|----------|--------|
+| 8 | 3 | 5.11e-04 | 14.2MB | FITS |
+| 16 | 4 | 1.54e-04 | 19.5MB | OVER |
+| 256 | 8 | 6.40e-06 | 38.9MB | OVER |
+| uniform int6 | 6 | 8.67e-05 | ~15-23MB | varies |
+
+- K=8 (3 bits): MSE comparable to Lloyd-Max int4, 14.2MB artifact
+- zstd compresses unused high bits of uint8 indices effectively
+- **Differentiable training version** (jointly optimize codebook + weights) untested but promising
+
+### Why Lloyd-Max / MSE-Optimal Quantization Loses to GPTQ 🤔
+
+Theoretical analysis of why information-theoretically optimal quantizers don't win in practice:
+1. **Not all weights matter equally** — GPTQ uses Hessian to know which weights are important
+2. **Co-adaptation** — GPTQ compensates errors across columns; independent quantizers can't
+3. **Compression paradox** — max entropy codes (Lloyd-Max) are incompressible; "wasted" uniform codes compress well with zstd
+4. **The system is model + compressor** — STE optimizes for the full system, not just the quantizer
+
+---
+
+## Hierarchical Multi-Resolution Transformer 🔬 Prototype tested | **Novel**
+
+### Architecture Overview
+
+**Core insight**: distant context needs less resolution. Compress old context with a shared convnet, attend globally at low cost, predict at full resolution for the last window.
+
+```
+Input: 4096 tokens at embed_dim=32
+
+Windows 0-14 (past context):
+  → Shared window encoder (convnet: 256 tokens → 1 token at dim 512)
+  → 15 compressed tokens
+  → Global transformer (BIDIRECTIONAL, 15×15 attention — nearly free)
+  → Rich context representations
+
+Window 15 (prediction window, 256 tokens):
+  → Project embed_dim → model_dim
+  → Local decoder (2 layers):
+      - First 192 tokens: BIDIRECTIONAL self-attention (known context)
+      - Last 64 tokens: CAUSAL self-attention (predictions)
+      - ALL positions: cross-attention to 15 global summaries
+  → Predict last 64 tokens only
+```
+
+### Design decisions and rationale
+
+1. **Non-overlapping windows** (stride=256): each summary covers unique content. Overlap is redundant since the global transformer bridges windows.
+
+2. **Window 15 NOT in global path**: including it causes information leakage — the convnet compresses ALL 256 tokens (including future tokens that haven't been predicted yet). The convnet has no causal ordering.
+
+3. **Global transformer is BIDIRECTIONAL**: windows 0-14 are all in the past — no causality constraint. Bidirectional lets each summary be enriched by all other summaries. This is an encoder-decoder architecture: encoder (bidirectional global) + decoder (causal local).
+
+4. **Prefix-causal local attention**: first 192 tokens are bidirectional (known from previous slides), last 64 are causal (being predicted). This gives every prediction 192 fine-grained neighbors + 15 global summaries.
+
+5. **Sliding eval with stride=64**: each slide predicts 64 new tokens. The 192-token prefix provides fine-grained context at window boundaries. Global encoder can be cached every 4 slides (when window alignment repeats). **5× cheaper per predicted token than standard sliding window eval.**
+
+6. **Training stride=256**: more independent gradients (75% less overlap between examples). Every token is trained as context even if not predicted. Eval uses stride=64 — the prediction task is identical regardless of stride.
+
+### Window encoder (shared, ~1.5M params)
+```
+Conv1d(32→128, k=8, s=8):  256 tokens → 32 tokens
+Conv1d(128→256, k=4, s=4): 32 tokens → 8 tokens
+Conv1d(256→512, k=8, s=8): 8 tokens → 1 token
+Linear(512→512):           final projection
+```
+
+### Compute comparison
+
+| | Standard 13L (seq=1024) | Hierarchical (4096 ctx) |
+|---|---|---|
+| Context | 1024 tokens | **4096 tokens** |
+| Compute/predicted token | 88 MFLOP | **34 MFLOP** |
+| Steps in 10 min (est.) | ~4000 | **~37,000** |
+| Sliding eval cost | 1400 MFLOP/token | **280 MFLOP/token** |
+
+### Prototype results
+- **1.3171 BPB** at 30K steps (same wall clock as standard 1000 steps)
+- Standard at 1000 steps: 1.306 BPB → only 0.011 gap
+- Used simple Adam optimizer, no Muon, no 1cycle — significant room for improvement
+- 75ms/step on H100 SXM, 38.4M params
+- **⚠️ Result may be inflated**: prototype had window 15 in global path (information leakage). Need to rerun with clean architecture.
+- **Script**: `train_hierarchical.py`
+
+### Smaller hierarchical for artifact budget
+- Current: 38.4M params (same as 16L standard — doesn't save artifact space)
+- Reduce to 6 global layers: ~31M params (same as 13L standard)
+- Or reduce model_dim to 384: ~20M params (could fit in 16MB with int6 + GPTQ)
+- The architecture's value is in **compute efficiency** (more steps/minute) not param efficiency
 
 ---
 
@@ -349,19 +483,57 @@
 
 Key techniques from @abaybektursun:
 - **GPTQ (Full Hessian)**: +0.002 gap. AR self-generated calibration data
-- **11L, MLP 3×**: ~7000 steps at 86ms/step
+- **11L, MLP 3×**: ~7000 steps at 86ms/step. "MLP 3× is the single largest contributor"
 - **XSA all layers, BigramHash 3072×112, Late QAT, EMA+SWA**
 - **Sliding window eval**: stride 64, free -0.025 to -0.035 BPB
 - Blog: https://abay.tech/posts/pr-1019-model-autopsy
 - MLP needs 7-8 bits, attention survives at 4-5 bits (stable rank predicts sensitivity)
 
+### Width vs Depth (from competition analysis)
+- SOTA uses 11L/MLP 3× (~22M params). We used 13L/MLP 2× (31M params).
+- SOTA's wider MLP is more important than our extra depth
+- Middle layers are quantization-insensitive → possibly superfluous for this task size
+- **Untested**: fewer but much wider layers (e.g., 7L/MLP 5×, 5L/MLP 8×)
+- Going wider saves latency (parallel GPU compute) while depth adds sequential steps
+
+---
+
+## Ideas Worth Pursuing
+
+### Hierarchical architecture improvements 💡
+- Implement clean version (no window 15 leakage, bidirectional global, prefix-causal local)
+- Add Muon optimizer, 1cycle LR, proper training pipeline
+- Test smaller versions (6 global layers, dim=384) that fit in 16MB
+- Combine with GPTQ for serialization
+
+### FP8 training 💡
+- torch.float8_e4m3fn available on PyTorch 2.4.1 + A100/H100
+- Could give ~1.5-2× faster matmuls → more steps in 10 min
+- Implementation needed (convert matmuls to FP8)
+
+### Width experiments 💡
+- Test 7L/MLP 5× vs 11L/MLP 3× vs 13L/MLP 2× at same param count
+- Measure BPB vs step time trade-off
+- Extreme: 5L/MLP 8× — maximum width, minimum depth
+
+### Differentiable codebook training 💡
+- Weight palette with K=8-16 entries, jointly trained with the model
+- Straight-through or Gumbel-softmax for discrete index selection
+- Could discover non-obvious weight distributions that quantize optimally
+
+### Reduced embedding dimension 💡
+- Vocab=1024 tokens could theoretically be represented in 10 bits
+- Current embed_dim=512 is 50× overkill for token identity
+- Test embed_dim=32-64 with projection to model_dim — saves embedding params and could improve generalization
+
 ---
 
 ## Priority Stack
 
-1. **Weight palette** 💡 — Learned 256-entry codebook, jointly trained
-2. **Differentiable codebook** 💡 — End-to-end learnable quantization
-3. **GPTQ** — Closes 80% of roundtrip gap (+0.047 → ~+0.005)
-4. **Sliding window eval** — Free -0.025 BPB
-5. **MLP 3× + 11L** — Match SOTA architecture
-6. **Trim code** — 150KB train_combined.py wastes artifact budget
+1. **Hierarchical clean implementation** — Fix leakage, add Muon/1cycle, test at competition scale
+2. **Width experiments** — 7L/MLP 5× or similar, measure compute-BPB frontier
+3. **GPTQ integration** — Deploy our GPTQ into the training pipeline for competition submission
+4. **Sliding window eval** — Implement for both standard and hierarchical models
+5. **FP8 training** — Faster steps → more training in 10 min
+6. **Differentiable codebook** — Train with learned quantization end-to-end
+7. **Trim code** — 150KB train_combined.py wastes artifact budget

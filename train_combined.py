@@ -1156,14 +1156,22 @@ def get_lloyd_max_lut(n_levels: int, device) -> Tensor:
     return _LLOYD_MAX_LUT_CACHE[n_levels]
 
 class QuantizedLinear(nn.Linear):
-    """Quantized linear layer. Supports ternary ({-1,0,1}) or int6 ([-31,31]) STE."""
+    """Quantized linear layer. Supports ternary ({-1,0,1}) or int6 ([-31,31]) STE.
+    Per-layer override: set layer.ste_override = "ternary"/"int6"/"none" to override global mode.
+    """
     def __init__(self, in_features, out_features, bias=False, group_size=64):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
+        self.ste_override = None  # None = use global, "ternary"/"int6"/"none" = per-layer
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if _QUANT_MODE == "int6" and self.training and _INT6_ACTIVE and _STE_ENABLED:
+        # Determine STE mode: per-layer override or global
+        mode = self.ste_override if self.ste_override is not None else (
+            _QUANT_MODE if _STE_ENABLED else "none")
+        if not self.training:
+            mode = "none"
+        if mode == "int6" and _INT6_ACTIVE:
             if _STE_TYPE == "lloyd_max":
                 # Lloyd-Max STE: snap to nearest Gaussian-optimal centroid.
                 with torch.no_grad():
@@ -1184,7 +1192,7 @@ class QuantizedLinear(nn.Linear):
                     w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
                     w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
                 w = w.to(x.dtype) + (w_q - w.to(x.dtype)).detach()
-        elif _QUANT_MODE == "ternary" and _STE_ENABLED:
+        elif mode == "ternary":
             # Ternary STE: fake quantize to {-1, 0, 1} per group.
             w = w.bfloat16()
             g = self.group_size
@@ -2183,6 +2191,31 @@ def find_temp(args, base_model, rank, world_size, device, grad_accum_steps,
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def set_mixed_ste(model, ternary_blocks: list[int] | None = None, int6_blocks: list[int] | None = None):
+    """Set per-block STE modes for mixed-precision training.
+    Blocks in ternary_blocks get ternary STE, int6_blocks get int6 STE, others get no STE.
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, QuantizedLinear):
+            block_idx = -1
+            for i in range(100):
+                if f"blocks.{i}." in name:
+                    block_idx = i
+                    break
+            if ternary_blocks and block_idx in ternary_blocks:
+                module.ste_override = "ternary"
+            elif int6_blocks and block_idx in int6_blocks:
+                module.ste_override = "int6"
+            else:
+                module.ste_override = "none"
+    # Count
+    counts = {"ternary": 0, "int6": 0, "none": 0}
+    for m in model.modules():
+        if isinstance(m, QuantizedLinear) and m.ste_override:
+            counts[m.ste_override] = counts.get(m.ste_override, 0) + 1
+    return counts
+
+
 def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT | None":
     args = Hyperparameters()
     # Re-read mutable env vars (may change between calls in ensemble mode).
@@ -2323,6 +2356,15 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
         loaded = {k: v.to(dtype=model_sd[k].dtype) for k, v in ckpt.items() if k in model_sd}
         base_model.load_state_dict(loaded, strict=False)
         log0(f"loaded weights from {load_weights_path} ({len(loaded)}/{len(model_sd)} keys)")
+
+    # Mixed-precision STE: TERNARY_BLOCKS=2,3,4,...,10 INTX_BLOCKS=0,1,11,12
+    ternary_blocks_str = os.environ.get("TERNARY_BLOCKS", "")
+    intx_blocks_str = os.environ.get("INTX_BLOCKS", "")
+    if ternary_blocks_str:
+        ternary_blocks = [int(x) for x in ternary_blocks_str.split(",")]
+        intx_blocks = [int(x) for x in intx_blocks_str.split(",")] if intx_blocks_str else []
+        counts = set_mixed_ste(base_model, ternary_blocks=ternary_blocks, int6_blocks=intx_blocks)
+        log0(f"mixed_ste: ternary={counts.get('ternary',0)} int6={counts.get('int6',0)} none={counts.get('none',0)}")
 
     torch._dynamo.config.optimize_ddp = False
 
@@ -2718,7 +2760,32 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
             torch.save({k: v.cpu().float() for k, v in sd.items()}, float_file)
             log0(f"saved float weights: {float_file} ({os.path.getsize(float_file)/1e6:.1f}MB)")
 
-        if args.quant_scheme.startswith("lloyd_max"):
+        if args.quant_scheme == "mixed_ternary":
+            # Mixed serialization: ternary for blocks in TERNARY_BLOCKS, int6+GPTQ for the rest
+            # For now: ternary for marked blocks, int6 for others
+            ternary_names = set()
+            for name in sd:
+                for bi in (int(x) for x in os.environ.get("TERNARY_BLOCKS", "").split(",") if x):
+                    if f"blocks.{bi}." in name:
+                        ternary_names.add(name)
+            methods = {}
+            for method in ("standard", "bitmask"):
+                q_obj, stats = q_sd(sd, group_size=args.bitnet_group_size,
+                                    ternary_method=method, ternary_override_names=ternary_names)
+                buf = io.BytesIO()
+                torch.save(q_obj, buf)
+                try:
+                    import zstandard
+                    blob = zstandard.ZstdCompressor(level=22).compress(buf.getvalue())
+                except ImportError:
+                    blob = lzma.compress(buf.getvalue(), preset=9)
+                methods[method] = {"blob": blob, "stats": stats}
+            best = min(methods, key=lambda m: len(methods[m]["blob"]))
+            final_blob = methods[best]["blob"]
+            q_stats = methods[best]["stats"]
+            log0(f"mixed_ternary serialization: ternary_blocks={len(ternary_names)} "
+                 f"ternary:{q_stats['ternary_params']} fp:{q_stats['fp_params']}")
+        elif args.quant_scheme.startswith("lloyd_max"):
             # Lloyd-Max serialization: Gaussian-optimal quantization
             n_levels = {"lloyd_max_int3": 7, "lloyd_max_int4": 15, "lloyd_max_int5": 31,
                         "lloyd_max": 63}.get(args.quant_scheme, 15)
@@ -2846,6 +2913,8 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
 
     if args.quant_scheme.startswith("lloyd_max"):
         base_model.load_state_dict(deq_sd_lloyd_max(loaded), strict=False)
+    elif args.quant_scheme == "mixed_ternary" or args.quant_mode == "ternary":
+        base_model.load_state_dict(deq_sd(loaded), strict=False)
     elif args.quant_mode == "int6":
         base_model.load_state_dict(deq_sd_int6(loaded), strict=False)
     else:
