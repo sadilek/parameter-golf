@@ -116,6 +116,7 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    resume_from = os.environ.get("RESUME_FROM", "")  # path to checkpoint .pt file
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -130,17 +131,26 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model.
+    arch = os.environ.get("ARCH", "gru")  # "gru" or "diffusion"
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+    p_causal = float(os.environ.get("P_CAUSAL", 0.2))
+    n_channels = int(os.environ.get("N_CHANNELS", 1))
 
     # Think/Know architecture.
     think_depth = int(os.environ.get("THINK_DEPTH", 0))
     num_know_layers = int(os.environ.get("NUM_KNOW_LAYERS", 6))
     num_cycles = int(os.environ.get("NUM_CYCLES", 1))
+
+    # Latent diffusion refinement.
+    use_diffusion = bool(int(os.environ.get("USE_DIFFUSION", "0")))
+    diffusion_steps = int(os.environ.get("DIFFUSION_STEPS", 4))
+    diffusion_alpha = float(os.environ.get("DIFFUSION_ALPHA", 0.1))
 
     # Optimizer: Muon for matrix params, Adam for embeddings/scalars.
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
@@ -442,19 +452,234 @@ class GRUBlock(nn.Module):
         return x
 
 
+# ==============================================================================
+# MASKED DIFFUSION TRANSFORMER
+# ==============================================================================
+
+class Rotary(nn.Module):
+    """RoPE positional encoding with cached cos/sin tables."""
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if self._cos_cached is None or self._seq_len_cached != seq_len or self._cos_cached.device != device:
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._seq_len_cached = seq_len
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+class TernaryAttention(nn.Module):
+    """Multi-head attention with RoPE, ternary weights, causal or bidirectional."""
+    def __init__(self, dim: int, num_heads: int, rope_base: float = 10000.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv_proj = TernaryLinear(dim, 3 * dim)
+        self.out_proj = TernaryLinear(dim, dim)
+        nn.init.zeros_(self.out_proj.weight)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor, causal: bool = True) -> Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv_proj(x).reshape(B, T, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each: (B, H, T, head_dim)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(T, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        return self.out_proj(y.transpose(1, 2).contiguous().reshape(B, T, D))
+
+
+class DiffusionBlock(nn.Module):
+    """Pre-norm attention + pre-norm MLP, with switchable causal/bidirectional."""
+    def __init__(self, dim: int, num_heads: int, mlp_mult: int):
+        super().__init__()
+        self.pre_attn_norm = nn.RMSNorm(dim)
+        self.attn = TernaryAttention(dim, num_heads)
+        self.post_attn_norm = nn.RMSNorm(dim)
+
+        self.pre_mlp_norm = nn.RMSNorm(dim)
+        self.mlp = GatedMLP(dim, mlp_mult)
+        self.post_mlp_norm = nn.RMSNorm(dim)
+
+        self.attn_scale = nn.Parameter(torch.ones(dim))
+        self.mlp_scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor, causal: bool = True) -> Tensor:
+        h = self.attn(self.pre_attn_norm(x), causal=causal)
+        h = self.post_attn_norm(h)
+        x = x + self.attn_scale * h
+        m = self.mlp(self.pre_mlp_norm(x))
+        m = self.post_mlp_norm(m)
+        x = x + self.mlp_scale * m
+        return x
+
+
+class MaskedDiffusionLM(nn.Module):
+    """Ternary transformer trained with masked diffusion + optional signal superposition.
+
+    Training modes (randomly selected per batch):
+      1. Causal AR (p_causal): standard next-token prediction, single sequence
+      2. Masked diffusion (1-p_causal): bidirectional masked prediction
+         - With superposition (n_channels>1): multiple sequences superimposed,
+           each labeled with a channel embedding. The model demultiplexes them
+           like CDMA. 2x data diversity per forward pass.
+         - Without superposition (n_channels=1): standard masked prediction.
+
+    Evaluation: causal attention, single channel → standard cross-entropy → valid BPB.
+    """
+    def __init__(
+        self, vocab_size: int, num_layers: int, dim: int, num_heads: int,
+        mlp_mult: int, logit_softcap: float, tied_embed_init_std: float,
+        p_causal: float = 0.2, mask_rate_min: float = 0.15, mask_rate_max: float = 0.85,
+        n_channels: int = 1,
+    ):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.vocab_size = vocab_size
+        self.p_causal = p_causal
+        self.mask_rate_min = mask_rate_min
+        self.mask_rate_max = mask_rate_max
+        self.n_channels = n_channels
+
+        # Token embedding (+1 for [MASK] token).
+        self.tok_emb = nn.Embedding(vocab_size + 1, dim)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
+        self.mask_token_id = vocab_size
+
+        # Channel embeddings for superposition (input labeling + output querying).
+        if n_channels > 1:
+            self.channel_in = nn.Parameter(torch.randn(n_channels, dim) * 0.02)
+            self.channel_out = nn.Parameter(torch.randn(n_channels, dim) * 0.02)
+
+        self.blocks = nn.ModuleList([DiffusionBlock(dim, num_heads, mlp_mult) for _ in range(num_layers)])
+        self.final_norm = nn.RMSNorm(dim)
+
+    def _logits(self, h: Tensor) -> Tensor:
+        """Project hidden states to vocab logits with softcap."""
+        logits = F.linear(h, self.tok_emb.weight[:self.vocab_size].to(h.dtype))
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        B, T = input_ids.shape
+        dim = self.tok_emb.weight.shape[1]
+
+        if self.training:
+            use_causal = torch.rand(1).item() < self.p_causal
+            if use_causal:
+                # --- Causal AR training (single channel, no superposition) ---
+                x = F.rms_norm(self.tok_emb(input_ids).float(), (dim,))
+                if self.n_channels > 1:
+                    x = x + self.channel_in[0]  # always channel 0 for causal
+                for block in self.blocks:
+                    x = block(x, causal=True)
+                x = self.final_norm(x).reshape(-1, dim)
+                if self.n_channels > 1:
+                    x = x + self.channel_out[0]
+                logits = self._logits(x)
+                return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+            else:
+                # --- Masked diffusion training ---
+                mask_rate = self.mask_rate_min + torch.rand(1).item() * (self.mask_rate_max - self.mask_rate_min)
+
+                if self.n_channels > 1:
+                    # SUPERPOSITION: split batch into n_channels groups, superimpose.
+                    C = self.n_channels
+                    group_size = B // C
+                    if group_size == 0:
+                        group_size = B
+                        C = 1  # fallback if batch too small
+
+                    # Embed and mask each channel independently.
+                    superimposed = torch.zeros(group_size, T, dim, device=input_ids.device, dtype=torch.float32)
+                    all_masks = []
+                    all_targets = []
+                    for c in range(C):
+                        ids_c = input_ids[c * group_size : (c + 1) * group_size]
+                        tgt_c = target_ids[c * group_size : (c + 1) * group_size]
+                        mask_c = torch.rand(group_size, T, device=input_ids.device) < mask_rate
+                        masked_ids_c = ids_c.clone()
+                        masked_ids_c[mask_c] = self.mask_token_id
+                        emb_c = F.rms_norm(self.tok_emb(masked_ids_c).float(), (dim,))
+                        superimposed = superimposed + emb_c + self.channel_in[c]
+                        all_masks.append(mask_c)
+                        all_targets.append(tgt_c)
+
+                    # Process the superimposed signal bidirectionally.
+                    x = superimposed
+                    for block in self.blocks:
+                        x = block(x, causal=False)
+                    x = self.final_norm(x)
+
+                    # Demultiplex: predict each channel's masked tokens.
+                    total_loss = torch.zeros((), device=x.device)
+                    for c in range(C):
+                        x_c = x + self.channel_out[c]  # channel-specific query
+                        masked_x_c = x_c[all_masks[c]]
+                        if masked_x_c.numel() == 0:
+                            continue
+                        logits_c = self._logits(masked_x_c)
+                        total_loss = total_loss + F.cross_entropy(logits_c.float(), all_targets[c][all_masks[c]], reduction="mean")
+                    return total_loss / C
+                else:
+                    # Standard masked diffusion (no superposition).
+                    mask = torch.rand(B, T, device=input_ids.device) < mask_rate
+                    masked_ids = input_ids.clone()
+                    masked_ids[mask] = self.mask_token_id
+                    x = F.rms_norm(self.tok_emb(masked_ids).float(), (dim,))
+                    for block in self.blocks:
+                        x = block(x, causal=False)
+                    x = self.final_norm(x)
+                    masked_x = x[mask]
+                    logits = self._logits(masked_x)
+                    return F.cross_entropy(logits.float(), target_ids[mask], reduction="mean")
+        else:
+            # --- Eval: standard causal autoregressive (single channel) ---
+            x = F.rms_norm(self.tok_emb(input_ids).float(), (dim,))
+            if self.n_channels > 1:
+                x = x + self.channel_in[0]
+            for block in self.blocks:
+                x = block(x, causal=True)
+            x = self.final_norm(x).reshape(-1, dim)
+            if self.n_channels > 1:
+                x = x + self.channel_out[0]
+            logits = self._logits(x)
+            return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+
+
 class TernaryGPT(nn.Module):
-    """Ternary GRU language model with optional Think/Know weight sharing."""
+    """Ternary GRU language model with optional Think/Know sharing and latent diffusion refinement."""
     def __init__(
         self,
         vocab_size: int, num_layers: int, dim: int, mlp_mult: int,
         logit_softcap: float, tied_embed_init_std: float,
         think_depth: int = 0, num_know_layers: int = 6, num_cycles: int = 1,
+        use_diffusion: bool = False, diffusion_steps: int = 4, diffusion_alpha: float = 0.1,
     ):
         super().__init__()
         self.logit_softcap = logit_softcap
         self.think_depth = think_depth
         self.num_know_layers = num_know_layers
         self.num_cycles = num_cycles
+        self.use_diffusion = use_diffusion
+        self.diffusion_steps = diffusion_steps
+        self.diffusion_alpha = diffusion_alpha
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
@@ -475,6 +700,13 @@ class TernaryGPT(nn.Module):
             self.know_blocks = nn.ModuleList()
             self._sequence = [("block", i) for i in range(num_layers)]
 
+        # Latent diffusion: shared denoiser block + noise level embedding.
+        if use_diffusion:
+            self.denoise_block = GRUBlock(dim, mlp_mult)
+            self.noise_emb = nn.Sequential(
+                nn.Linear(1, dim), nn.SiLU(), nn.Linear(dim, dim),
+            )
+
         self.final_norm = nn.RMSNorm(dim)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -488,11 +720,35 @@ class TernaryGPT(nn.Module):
             else:
                 x = self.blocks[idx](x)
 
+        # --- Latent diffusion refinement ---
+        denoise_loss = torch.zeros((), device=x.device)
+        if self.use_diffusion:
+            if self.training:
+                h_clean = x.detach()
+                # Sample noise level per batch element: (B,1,1).
+                t = torch.rand(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
+                noise = torch.randn_like(x)
+                x_noisy = (1.0 - t) * x + t * noise
+                # Noise conditioning: (B,1,1) → (B,1,dim), broadcasts across seq.
+                t_emb = self.noise_emb(t).expand_as(x)
+                h = x_noisy
+                for _ in range(self.diffusion_steps):
+                    h = self.denoise_block(h + t_emb)
+                denoise_loss = F.mse_loss(h, h_clean)
+                x = h
+            else:
+                # Inference: refine with t=0 (no noise).
+                t_zero = torch.zeros(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
+                t_emb = self.noise_emb(t_zero).expand_as(x)
+                for _ in range(self.diffusion_steps):
+                    x = self.denoise_block(x + t_emb)
+
         x = self.final_norm(x).reshape(-1, self.tok_emb.weight.shape[1])
         targets = target_ids.reshape(-1)
         logits = F.linear(x, self.tok_emb.weight.to(x.dtype))
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        return ce_loss + self.diffusion_alpha * denoise_loss
 
 
 # ==============================================================================
@@ -636,14 +892,24 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
 
     # --- Model ---
-    log0("creating model...")
-    base_model = TernaryGPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
-        mlp_mult=args.mlp_mult, logit_softcap=args.logit_softcap,
-        tied_embed_init_std=args.tied_embed_init_std,
-        think_depth=args.think_depth, num_know_layers=args.num_know_layers,
-        num_cycles=args.num_cycles,
-    ).to(device)
+    log0(f"creating model... arch:{args.arch}")
+    if args.arch == "diffusion":
+        base_model = MaskedDiffusionLM(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+            num_heads=args.num_heads, mlp_mult=args.mlp_mult,
+            logit_softcap=args.logit_softcap, tied_embed_init_std=args.tied_embed_init_std,
+            p_causal=args.p_causal, n_channels=args.n_channels,
+        ).to(device)
+    else:
+        base_model = TernaryGPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+            mlp_mult=args.mlp_mult, logit_softcap=args.logit_softcap,
+            tied_embed_init_std=args.tied_embed_init_std,
+            think_depth=args.think_depth, num_know_layers=args.num_know_layers,
+            num_cycles=args.num_cycles,
+            use_diffusion=args.use_diffusion, diffusion_steps=args.diffusion_steps,
+            diffusion_alpha=args.diffusion_alpha,
+        ).to(device)
     # Keep TernaryLinear weights in fp32 (shadow weights). Everything else in bf16.
     base_model.to(compute_dtype)
     for m in base_model.modules():
@@ -696,10 +962,22 @@ def main() -> None:
     use_scaler = compute_dtype == torch.float16
     scaler = torch.amp.GradScaler(enabled=use_scaler)
 
+    # --- Resume from checkpoint ---
+    resume_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        base_model.load_state_dict(ckpt["model_state_dict"])
+        for opt, opt_state in zip(optimizers, ckpt["optimizers"]):
+            opt.load_state_dict(opt_state)
+        scaler.load_state_dict(ckpt["scaler"])
+        resume_step = ckpt["step"]
+        log0(f"resumed from {args.resume_from} at step {resume_step}")
+
     n_params = sum(p.numel() for p in base_model.parameters())
     n_ternary = sum(p.numel() for p in base_model.parameters() if p.ndim == 2 and p.numel() > 4096)
     log0(f"run_id:{args.run_id}")
-    log0(f"architecture:ternary_gru model_params:{n_params} ternary_params:{n_ternary}")
+    arch_label = "masked_diffusion_transformer" if args.arch == "diffusion" else "ternary_gru"
+    log0(f"architecture:{arch_label} model_params:{n_params} ternary_params:{n_ternary}")
     if args.think_depth > 0:
         eff_depth = len(base_model._sequence)
         unique = len(list(base_model.think_blocks)) + len(list(base_model.know_blocks))
@@ -708,6 +986,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"optimizer:muon+adam matrix_params:{len(matrix_params)} scalar_params:{len(scalar_params)} embed_params:{len(embed_params)}")
     log0(f"matrix_lr:{args.matrix_lr} embed_lr:{args.embed_lr} scalar_lr:{args.scalar_lr} muon_momentum:{args.muon_momentum}")
+    if args.use_diffusion:
+        log0(f"diffusion: steps:{args.diffusion_steps} alpha:{args.diffusion_alpha}")
+    if args.arch == "diffusion" and args.n_channels > 1:
+        log0(f"superposition: n_channels:{args.n_channels}")
     log0(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens}")
 
     # --- Data loader ---
@@ -765,8 +1047,8 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    step = 0
-    log0("training_loop:start")
+    step = resume_step
+    log0(f"training_loop:start step:{step}")
 
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -836,6 +1118,17 @@ def main() -> None:
             stop_after_step = step
 
     log0(f"peak memory: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # --- Save checkpoint for resumption ---
+    if master_process:
+        ckpt_path = Path(f"logs/{args.run_id}_checkpoint.pt")
+        torch.save({
+            "step": step,
+            "model_state_dict": base_model.state_dict(),
+            "optimizers": [opt.state_dict() for opt in optimizers],
+            "scaler": scaler.state_dict(),
+        }, ckpt_path)
+        log0(f"checkpoint saved: {ckpt_path}")
 
     # --- Serialization + roundtrip ---
     if master_process:

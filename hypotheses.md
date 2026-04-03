@@ -408,7 +408,7 @@ Theoretical analysis of why information-theoretically optimal quantizers don't w
 
 ---
 
-## Hierarchical Multi-Resolution Transformer 🔬 Prototype tested | **Novel**
+## Hierarchical Multi-Resolution Transformer 🔬 Clean implementation ready | **Novel**
 
 ### Architecture Overview
 
@@ -418,18 +418,18 @@ Theoretical analysis of why information-theoretically optimal quantizers don't w
 Input: 4096 tokens at embed_dim=32
 
 Windows 0-14 (past context):
-  → Shared window encoder (convnet: 256 tokens → 1 token at dim 512)
+  → Shared window encoder (convnet: 256 tokens → 1 token at dim 384)
   → 15 compressed tokens
-  → Global transformer (BIDIRECTIONAL, 15×15 attention — nearly free)
+  → Global transformer (BIDIRECTIONAL, 6 layers, 15×15 attention — nearly free)
   → Rich context representations
 
-Window 15 (prediction window, 256 tokens):
+Window 15 (prediction window, 256 tokens — NOT in global path):
   → Project embed_dim → model_dim
-  → Local decoder (2 layers):
+  → Local decoder (2 layers, prefix-causal + cross-attention to 15 global summaries):
       - First 192 tokens: BIDIRECTIONAL self-attention (known context)
       - Last 64 tokens: CAUSAL self-attention (predictions)
-      - ALL positions: cross-attention to 15 global summaries
-  → Predict last 64 tokens only
+  → Logits from positions 191-254 predict tokens at positions 192-255
+  → Loss on 64 predicted tokens only (targets within window, no +1 read needed)
 ```
 
 ### Design decisions and rationale
@@ -442,40 +442,89 @@ Window 15 (prediction window, 256 tokens):
 
 4. **Prefix-causal local attention**: first 192 tokens are bidirectional (known from previous slides), last 64 are causal (being predicted). This gives every prediction 192 fine-grained neighbors + 15 global summaries.
 
-5. **Sliding eval with stride=64**: each slide predicts 64 new tokens. The 192-token prefix provides fine-grained context at window boundaries. Global encoder can be cached every 4 slides (when window alignment repeats). **5× cheaper per predicted token than standard sliding window eval.**
+5. **Targets within window**: logit at position i predicts token at position i+1. Using logits from positions 191-254 (64 logits), targets are tokens at positions 192-255 — all within the 256-token window. No +1 token read needed. The model only needs `input_ids`, no separate `target_ids`.
 
-6. **Training stride=256**: more independent gradients (75% less overlap between examples). Every token is trained as context even if not predicted. Eval uses stride=64 — the prediction task is identical regardless of stride.
+6. **Sliding eval with stride=64**: each slide predicts 64 new tokens. The 192-token prefix provides fine-grained context at window boundaries. Used for both training monitoring and final evaluation.
 
-### Window encoder (shared, ~1.5M params)
+7. **Training stride=256 via streaming**: each step reads exactly 256 new tokens from a contiguous per-rank stream. Old prediction window becomes newest context (1 convnet pass with gradient, 14 cached detached). 25% token efficiency (64 predicted / 256 consumed) vs 1.5% without streaming. `TokenStream.take(n)` never crosses shard boundaries — returns short read if exhausted.
+
+8. **No DDP**: Muon handles its own gradient all-reduce. Non-Muon params (embedding, head, scalars, Conv1d) are manually all-reduced after backward. This avoids DDP incompatibility with the streaming forward path.
+
+### Window encoder (shared)
 ```
-Conv1d(32→128, k=8, s=8):  256 tokens → 32 tokens
-Conv1d(128→256, k=4, s=4): 32 tokens → 8 tokens
-Conv1d(256→512, k=8, s=8): 8 tokens → 1 token
-Linear(512→512):           final projection
+Conv1d(32→96, k=8, s=8):   256 tokens → 32 tokens
+Conv1d(96→192, k=4, s=4):  32 tokens → 8 tokens
+Conv1d(192→384, k=8, s=8): 8 tokens → 1 token
+Linear(384→384):            final projection
 ```
 
-### Compute comparison
+### Default config (fits 16MB with int6)
+```
+model_dim=384, n_global_layers=6, n_local_layers=2, n_heads=6, mlp_mult=3
+embed_dim=32, window_size=256, prefix_len=192, pred_len=64, total_seq=4096
+```
+Estimated ~18-20M params.
 
-| | Standard 13L (seq=1024) | Hierarchical (4096 ctx) |
+### FLOP breakdown (per forward pass, batch=1)
+
+| Component | FLOPs | % |
 |---|---|---|
-| Context | 1024 tokens | **4096 tokens** |
-| Compute/predicted token | 88 MFLOP | **34 MFLOP** |
-| Steps in 10 min (est.) | ~4000 | **~37,000** |
-| Sliding eval cost | 1400 MFLOP/token | **280 MFLOP/token** |
+| Window encoder (1 window, streaming) | 4.2M | 0.1% |
+| Window encoder (15 windows, cold start) | 63.4M | 2.1% |
+| Global transformer (6L × 15 tokens) | 347.1M | 12.0% |
+| **Local decoder (2L × 256 tokens)** | **2,495.8M** | **84.3%** |
+| LM head (64 tokens) | 50.3M | 1.7% |
+| **Total (streaming step)** | **2,904M** | |
 
-### Prototype results
+**vs Standard 13L** (seq=1024, dim=768): 45M vs 242M FLOPs per predicted token = **5.3× cheaper**.
+
+### Prototype results (OLD — had leakage bug)
 - **1.3171 BPB** at 30K steps (same wall clock as standard 1000 steps)
 - Standard at 1000 steps: 1.306 BPB → only 0.011 gap
-- Used simple Adam optimizer, no Muon, no 1cycle — significant room for improvement
+- Used simple Adam optimizer, no Muon, no 1cycle
 - 75ms/step on H100 SXM, 38.4M params
-- **⚠️ Result may be inflated**: prototype had window 15 in global path (information leakage). Need to rerun with clean architecture.
-- **Script**: `train_hierarchical.py`
+- **⚠️ Result inflated**: prototype had window 15 in global path (information leakage)
 
-### Smaller hierarchical for artifact budget
-- Current: 38.4M params (same as 16L standard — doesn't save artifact space)
-- Reduce to 6 global layers: ~31M params (same as 13L standard)
-- Or reduce model_dim to 384: ~20M params (could fit in 16MB with int6 + GPTQ)
-- The architecture's value is in **compute efficiency** (more steps/minute) not param efficiency
+### Clean implementation results (2026-04-03)
+
+**Smoke test** (dim=384, 6G+2L, 200 steps, 1xH100):
+- 17.9M params, 5.46MB artifact, 287ms/step
+- BPB: 4.19 → 2.93 in 200 steps. Roundtrip gap: +0.002
+
+**10-min run** (dim=576, 8G+2L, 1xA100 SXM):
+- 48.5M params, 2478 steps at 241ms/step
+- **BPB: 2.74** (roundtrip: 2.75, gap +0.007)
+- Artifact: 24.3MB — **OVER 16MB** (need smaller model)
+- Float weights saved: `saved_weights/float/hier_576d_8G2L_10min_float.pt`
+
+**LR sweep** (dim=512, 8G+2L, 500 steps, 1xA100 SXM):
+
+| LR multiplier | matrix_lr | BPB @ step 101 | BPB @ step 501 |
+|---|---|---|---|
+| **1× (baseline)** | 0.04 | 3.280 | **2.793** |
+| 2× | 0.08 | 3.268 | 2.887 |
+| 4× | 0.16 | 3.820 | 3.749 (diverging) |
+
+Higher LR hurts. Baseline 0.04 is already optimal. **The bottleneck is training signal, not learning rate.** At 64 predicted tokens per micro-step (512 per optimizer step), the model needs far more steps than the standard model (which predicts 1024 tokens per step) to reach competitive BPB.
+
+**Artifact size calibration**: dim=512, 8G+2L = 38.4M params → **12.4MB artifact** (fits 16MB). dim=576, 8G+2L = 48.5M params → 24.3MB (over). The param→artifact ratio is ~0.32 bytes/param with int6+zstd.
+
+**Key concern: 2.74-2.79 BPB is far behind standard 13L (1.31 BPB at same wall time).**
+Root cause: 64 predicted tokens per micro-step vs 1024 for standard → 3× less training signal per wall-clock minute despite cheaper per-token compute. The architecture's compute efficiency doesn't translate to training efficiency within a 10-min budget.
+
+**Possible mitigations**:
+- Reduce prefix from 192 to 128, predict 128 tokens instead of 64 → 2× more training signal
+- Add auxiliary loss on context windows (predict within the encoder)
+- Give the model more wall time (80 min on 1xH100 ≈ 10 min on 8xH100 in total compute)
+
+### Clean implementation status
+- **Script**: `train_hierarchical.py` (~970 lines, 43KB)
+- All architecture bugs fixed (no leakage, bidirectional global, prefix-causal mask, correct logit-target alignment)
+- Streaming training with convnet cache, per-rank shard-level data distribution
+- Muon optimizer, 1cycle LR, gradient accumulation, manual gradient all-reduce
+- Sliding eval (stride=64) for all validation
+- Int6 quantization + zstd compression + roundtrip eval
+- LOAD_WEIGHTS support for resumed training
 
 ---
 
@@ -500,11 +549,11 @@ Key techniques from @abaybektursun:
 
 ## Ideas Worth Pursuing
 
-### Hierarchical architecture improvements 💡
-- Implement clean version (no window 15 leakage, bidirectional global, prefix-causal local)
-- Add Muon optimizer, 1cycle LR, proper training pipeline
-- Test smaller versions (6 global layers, dim=384) that fit in 16MB
-- Combine with GPTQ for serialization
+### Prefix summary in global transformer 💡 Untested
+- Include the 192-token prefix of the prediction window as a 16th global token
+- No leakage — prefix tokens are known context, not predictions
+- Convnet can't handle 192 tokens (strides assume 256), so use a separate encoder: mean-pool + Linear projection to `(1, model_dim)`
+- Benefit: global summaries become conditioned on recent context before cross-attention. Second-order effect — the local decoder already has direct self-attention to the prefix. Worth testing after baseline.
 
 ### FP8 training 💡
 - torch.float8_e4m3fn available on PyTorch 2.4.1 + A100/H100
@@ -521,19 +570,14 @@ Key techniques from @abaybektursun:
 - Straight-through or Gumbel-softmax for discrete index selection
 - Could discover non-obvious weight distributions that quantize optimally
 
-### Reduced embedding dimension 💡
-- Vocab=1024 tokens could theoretically be represented in 10 bits
-- Current embed_dim=512 is 50× overkill for token identity
-- Test embed_dim=32-64 with projection to model_dim — saves embedding params and could improve generalization
-
 ---
 
 ## Priority Stack
 
-1. **Hierarchical clean implementation** — Fix leakage, add Muon/1cycle, test at competition scale
-2. **Width experiments** — 7L/MLP 5× or similar, measure compute-BPB frontier
-3. **GPTQ integration** — Deploy our GPTQ into the training pipeline for competition submission
-4. **Sliding window eval** — Implement for both standard and hierarchical models
-5. **FP8 training** — Faster steps → more training in 10 min
-6. **Differentiable codebook** — Train with learned quantization end-to-end
-7. **Trim code** — 150KB train_combined.py wastes artifact budget
+1. **Increase training signal** — Reduce prefix_len (128 or 64), predict more tokens per step. This is the #1 bottleneck.
+2. **Longer training run** — 80 min on 1xH100 to see if the architecture converges to competitive BPB given enough steps
+3. **Prefix summary experiment** — Add 16th global token from prediction prefix (mean-pool + Linear)
+4. **Width experiments** — Try wider MLP (mlp_mult=4) within artifact budget
+5. **GPTQ integration** — Adapt `gptq_quantize.py` for hierarchical model
+6. **FP8 training** — Faster steps → more training in 10 min
+7. **Differentiable codebook** — Train with learned quantization end-to-end

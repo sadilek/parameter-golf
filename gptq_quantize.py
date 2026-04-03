@@ -189,30 +189,29 @@ def get_bit_scheme(scheme_name, n_layers):
         return {i: {"attn": 7, "mlp": 7} for i in range(n_layers)}
     elif scheme_name == "uniform_int3":
         return {i: {"attn": 3, "mlp": 3} for i in range(n_layers)}
-    elif scheme_name == "mixed_6_6_4_4_3":
-        # First 2 blocks int6, next 2 int4, rest int3, last block int5
+    elif scheme_name == "mixed_6_6_4_4_5":
+        # User's step 1: non-aggressive. First 2=int6, middle=int4, last=int5
         scheme = {}
         for i in range(n_layers):
             if i < 2:
-                scheme[i] = {"attn": 31, "mlp": 31}
-            elif i < 4:
-                scheme[i] = {"attn": 7, "mlp": 7}
+                scheme[i] = {"attn": 31, "mlp": 31}  # int6
             elif i == n_layers - 1:
-                scheme[i] = {"attn": 15, "mlp": 15}
+                scheme[i] = {"attn": 15, "mlp": 15}  # int5
             else:
-                scheme[i] = {"attn": 3, "mlp": 3}
+                scheme[i] = {"attn": 7, "mlp": 7}    # int4
         return scheme
     elif scheme_name == "mixed_6_5_3_3_4":
+        # User's step 2: aggressive. block0=int6, block1=int5, middle=int3, last=int4
         scheme = {}
         for i in range(n_layers):
             if i == 0:
-                scheme[i] = {"attn": 31, "mlp": 31}
+                scheme[i] = {"attn": 31, "mlp": 31}  # int6
             elif i == 1:
-                scheme[i] = {"attn": 15, "mlp": 15}
-            elif i >= n_layers - 2:
-                scheme[i] = {"attn": 7, "mlp": 7}
+                scheme[i] = {"attn": 15, "mlp": 15}  # int5
+            elif i == n_layers - 1:
+                scheme[i] = {"attn": 7, "mlp": 7}    # int4
             else:
-                scheme[i] = {"attn": 3, "mlp": 3}
+                scheme[i] = {"attn": 3, "mlp": 3}    # int3
         return scheme
     elif scheme_name == "mixed_sensitivity":
         # Based on sensitivity map: block 0 int6, block 1 int5, blocks 2-3 int4, rest int3, last 2 int4
