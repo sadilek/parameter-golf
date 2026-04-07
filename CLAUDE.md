@@ -85,4 +85,24 @@ GPT-style transformer with:
 - **Use shell script files** for nohup commands (not inline bash -c) to avoid env var escaping issues.
 - **Use PYTHONUNBUFFERED=1** or `python -u` when redirecting output via nohup.
 - **Use grad_accum>=8** for eval_val on 13L+ models — smaller batches cause silent OOM and wrong BPB.
-- **Track all experiments** in `hypotheses.md` with results, not just plans.
+- **Track all experiments** in `logbook.md` — keep it up-to-date with hypotheses, experiment ideas, implementation caveats (non-obvious stuff), results, and analyses.
+- **Don't re-run baselines needlessly.** If we already have numbers from `logbook.md` or `hypotheses.md`, use them instead of burning GPU time.
+- **Be cost-conscious with GPU time.** Prefer 1×A100 ($1.39/hr) for screening. Use H100 only when speed matters. Don't run long eval jobs without compile on expensive GPUs.
+- **Artifact size depends on training duration.** Random weights compress ~2.5× better than trained weights. Always verify artifact size with TRAINED weights, not random init.
+- **6-bit packing hurts with zstd** — zstd already handles the wasted bits in int8. Packing removes the patterns zstd exploits, making artifacts ~33% larger.
+- **torch.compile segfaults on some pods** (PyTorch 2.4.1 + A100 PCIe pod `kj0v7b0djsxzsp`). Guard compile calls with COMPILE_MODE=off support.
+- **1cycle LR destabilizes at long training.** Works great at 500-1000 steps, but diverges at 2000-5000 steps. Use warmdown schedule for long runs.
+- **LOAD_WEIGHTS resumes model but NOT the LR schedule.** Don't resume training with a fresh 1cycle — it will ramp LR up on an already-converged model and diverge.
+
+## SOTA Reference (PR #1019, 1.115 BPB)
+
+The competition leader uses `train_gpt_sota.py` (downloaded from PR #1019). Key config:
+- 11L, 512d, 8H/4KV GQA, MLP×3 LeakyReLU(0.5)²
+- XSA all 11 layers, Partial RoPE 16/64, LN Scale 1/√(i+1)
+- BigramHash 3072×112, SmearGate, VE128 (layers 9,10)
+- U-Net skips, orthogonal init, logit softcap 30
+- Muon WD=0.04, warmdown=4000, seq=2048, batch=786K
+- EMA(0.997) + SWA(every 50), Late QAT at scale<0.15
+- Full Hessian GPTQ (AR self-gen calibration), LZMA preset=9
+- Sliding window eval stride=64 (gives -0.025 BPB free)
+- ~7000 steps at 86ms/step on 8×H100, 27.1M params, 15.9MB artifact

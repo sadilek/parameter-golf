@@ -505,26 +505,310 @@ Estimated ~18-20M params.
 | 2× | 0.08 | 3.268 | 2.887 |
 | 4× | 0.16 | 3.820 | 3.749 (diverging) |
 
-Higher LR hurts. Baseline 0.04 is already optimal. **The bottleneck is training signal, not learning rate.** At 64 predicted tokens per micro-step (512 per optimizer step), the model needs far more steps than the standard model (which predicts 1024 tokens per step) to reach competitive BPB.
+Higher LR hurts at 0.08+. But **lower LR helps** — see extended sweep below.
+
+**Extended LR + prefix/pred sweep** (dim=384, 6G+2L, 500 steps, 1xA100 SXM, 2026-04-03):
+
+| matrix_lr | prefix+pred | BPB @ 101 | BPB @ 501 | Roundtrip | Gap |
+|---|---|---|---|---|---|
+| 0.04 | 192+64 | 3.280 | 2.793 | — | — |
+| 0.08 | 192+64 | 3.268 | 2.887 | — | — |
+| 0.03 | 192+64 | 3.176 | 2.770 | 2.773 | +0.003 |
+| 0.03 | 128+128 | — | 2.716 | 2.717 | +0.001 |
+| 0.02 | 128+128 | — | 2.708 | 2.711 | +0.003 |
+| **0.02** | **64+192** | — | **2.678** | **2.680** | +0.002 |
+
+Key findings:
+- LR monotonically improves going lower: 0.04 → 0.03 → 0.02 (may not have bottomed out yet)
+- More prediction tokens monotonically better: 64 → 128 → 192 (more loss signal per step)
+- Best config so far: LR=0.02, 64+192 → **2.678 BPB** (roundtrip 2.680)
+- Total improvement over original baseline: **-0.115 BPB**
+- Quant roundtrip gap consistently tiny (~0.002)
+- Next to try: even lower LR (0.015?), even more prediction (32+224?), or both
 
 **Artifact size calibration**: dim=512, 8G+2L = 38.4M params → **12.4MB artifact** (fits 16MB). dim=576, 8G+2L = 48.5M params → 24.3MB (over). The param→artifact ratio is ~0.32 bytes/param with int6+zstd.
 
-**Key concern: 2.74-2.79 BPB is far behind standard 13L (1.31 BPB at same wall time).**
-Root cause: 64 predicted tokens per micro-step vs 1024 for standard → 3× less training signal per wall-clock minute despite cheaper per-token compute. The architecture's compute efficiency doesn't translate to training efficiency within a 10-min budget.
+**Key concern: 2.68 BPB is far behind standard 13L (1.31 BPB at same wall time).**
+Root cause: even with 192 predicted tokens per micro-step, it's still 5× less than the standard model's 1024. The architecture's compute efficiency doesn't translate to training efficiency within a 10-min budget.
 
 **Possible mitigations**:
-- Reduce prefix from 192 to 128, predict 128 tokens instead of 64 → 2× more training signal
+- Push pred_len even further (224? 240?) — trend hasn't plateaued yet
+- Lower LR further (0.015? 0.01?) — also hasn't plateaued
 - Add auxiliary loss on context windows (predict within the encoder)
 - Give the model more wall time (80 min on 1xH100 ≈ 10 min on 8xH100 in total compute)
 
+**Batched streaming** (2026-04-04):
+
+Previously: batch_size=1 with 8 sequential grad_accum steps → GPU at 10% util, 2% memory.
+Now: B independent token streams processed in a single batched forward pass.
+
+Batch size sweep (no compile, LR=0.04, 50 steps, grad_accum=8, 1×A100 SXM):
+
+| BS | ms/step | tokens/step | tokens/sec | BPB@50 | GPU mem |
+|---|---|---|---|---|---|
+| 64 | 509 | 98K | 192K | 2.688 | ~2 GB |
+| 128 | 537 | 196K | 365K | 2.690 | ~2 GB |
+| 256 | 701 | 393K | 561K | 2.689 | ~6 GB |
+| 512 | 1,090 | 786K | 721K | 2.688 | ~10 GB |
+| 1024 | 1,899 | 1.57M | 827K | 2.688 | ~20 GB |
+
+Key findings:
+- BPB flat across all BS at LR=0.04 → already curvature-limited, not noise-limited
+- ms/step roughly doubles per 2× BS beyond 128 (GPU compute now dominates)
+- Memory scales linearly, fits 80GB up to ~BS=4096
+- `torch.compile` recompiles per batch size and can OOM on pod CPU RAM at large BS
+
+**Joint BS × LR sweep** (BS=256, 50 steps, no compile, 1×A100):
+
+| LR | BPB@50 |
+|---|---|
+| 0.02 | 2.702 |
+| 0.04 | 2.689 |
+| **0.08** | **2.684** |
+| 0.12 | 2.713 |
+| 0.16 | 2.782 |
+
+**BS=512 LR sweep** (50 steps, no compile, 1×H100):
+
+| LR | BPB@50 |
+|---|---|
+| **0.06** | **2.610** |
+| 0.07 | 2.613 |
+| 0.08 | 2.615 |
+| 0.09 | 2.622 |
+| 0.10 | 2.626 |
+| 0.12 | 2.646 |
+| 0.16 | 2.706 |
+
+Optimal LR at BS=512 is ~0.06 (not sqrt-scaling — sublinear). BS=512 strongly beats BS=256 at their respective optimal LRs.
+
+**Full run: BS=512, LR=0.06, 500 steps, 1×H100 NVL, no compile:**
+
+| Step | BPB |
+|---|---|
+| 101 | 2.596 |
+| 201 | 2.559 |
+| 301 | 2.510 |
+| 401 | 2.461 |
+| **501** | **2.437** |
+| Roundtrip | 2.442 (+0.005) |
+
+**-0.241 BPB improvement** over pre-batching best (2.678). Loss curve still dropping steeply — not converged at 500 steps. 702ms/step on H100.
+
 ### Clean implementation status
-- **Script**: `train_hierarchical.py` (~970 lines, 43KB)
+- **Script**: `train_hierarchical.py` (~1000 lines, 45KB)
 - All architecture bugs fixed (no leakage, bidirectional global, prefix-causal mask, correct logit-target alignment)
-- Streaming training with convnet cache, per-rank shard-level data distribution
+- Batched streaming training with vectorized cache updates
 - Muon optimizer, 1cycle LR, gradient accumulation, manual gradient all-reduce
 - Sliding eval (stride=64) for all validation
 - Int6 quantization + zstd compression + roundtrip eval
 - LOAD_WEIGHTS support for resumed training
+
+**Deep local stack** (2026-04-04):
+
+14 local layers (48M params), BS=512, LR=0.03 (1cycle), 2000 steps, 1×H100, no compile:
+
+| Step | BPB | Note |
+|---|---|---|
+| 401 | 1.945 | |
+| **601** | **1.910** | 1cycle peak — best BPB |
+| 1001 | 2.335 | post-peak destabilization |
+| 2001 | 2.049 | never recovers to pre-peak |
+| Roundtrip | 2.123 | +0.074 gap (large model quantizes worse) |
+
+**Artifact: 28.5MB — OVER 16MB.** Sizing script used zlib but real pipeline is torch.save without extra compression. Need ~6-8 local layers to fit 16MB.
+
+Key findings:
+- **14 local layers hit 1.910 BPB** — massive improvement from 2-layer's 2.437
+- 1cycle peak LR=0.03 too aggressive for 2000 steps — destabilizes mid-training
+- Quantization gap +0.074 at 48M params (vs +0.005 at 18M) — needs GPTQ or better quant
+
+**Wide MLP experiment** (dim=384, 4 local layers, MLP×6, 36.2M params, BS=512, LR=0.03, 2000 steps, 1×H100):
+
+| Step | BPB |
+|---|---|
+| 601 | 1.984 |
+| 1001 | 1.878 |
+| 1601 | 1.732 |
+| **2001** | **1.686** |
+| Roundtrip | 1.708 (+0.023) |
+| Artifact | 19.6MB (OVER) |
+
+Key findings:
+- **1.686 BPB** — huge leap, still dropping steadily at step 2000 (not converged)
+- Wide MLP 2.5× faster/step than deep stack at same param count (1.4s vs 3.5s)
+- LR=0.03 with 2000-step 1cycle: **no destabilization** — monotonically improving
+- Artifact 19.6MB (over 16MB). Need MLP=5 (~31.8M) to fit, or better quantization (GPTQ)
+- Trained artifact is ~2.6× larger than random-weight estimate (19.6 vs 7.6MB)
+- **Artifact sizing rule of thumb: trained ≈ 2.5× random-weight compressed size**
+
+**MLP=4 with warmdown schedule** (dim=384, 4L+6G, 27.3M params, BS=512, LR=0.015, warmdown 1200, 5000 steps, 1×A100 SXM):
+
+| Step | BPB |
+|---|---|
+| 1001 | 2.059 |
+| 2001 | 1.888 |
+| 3001 | 1.824 |
+| 4001 | 1.769 |
+| **5001** | **1.687** |
+| Roundtrip | 1.737 (+0.050) |
+| **Artifact** | **15.2 MB (OK)** |
+
+Key findings:
+- **First run that fits 16MB** — 27.3M params, int6+zstd = 15.2MB
+- Warmdown schedule (flat LR → linear decay last 1200 steps): **no destabilization**, monotonic improvement
+- LR=0.03 diverges after ~2500 steps; LR=0.015 is stable for 5000+
+- Warmdown final boost: 1.816 → 1.687 (last 1200 steps with decaying LR)
+- Roundtrip gap +0.050 — GPTQ would help
+- H100 killed run projected ~1.645 at 5000 steps (slightly better, data ordering?)
+
+**MLP=6 with GPTQ + 6-bit packing** (dim=384, 4L+6G, 36.2M params, BS=512, LR=0.015, warmdown 1200, 5000 steps, 1×A100 SXM):
+
+| Step | BPB |
+|---|---|
+| 1001 | 2.038 |
+| 2001 | 1.873 |
+| 3001 | 1.809 |
+| 4001 | 1.752 |
+| **5001** | **1.665** |
+| Roundtrip | 1.712 (+0.047) |
+| Artifact | 26.0 MB (OVER) |
+
+Key findings:
+- **1.665 BPB** — best hierarchical result so far, but artifact 26MB (over)
+- **6-bit packing HURTS compression**: 26.0MB (packed+zstd) vs 19.6MB (int8+zstd) for same model. Packing removes the redundant top-2-bits pattern that zstd was already exploiting efficiently. Net effect: +33% larger artifact.
+- GPTQ roundtrip gap +0.047 — similar to naive int6 (+0.050 at MLP=4). GPTQ helps quality but doesn't shrink artifact size when combined with packing.
+- **Conclusion: don't use 6-bit packing with zstd compression.** Use int8 storage + GPTQ + zstd instead.
+
+**Quantization efficiency comparison:**
+- Our model: 27-36M params → 0.42-0.54 bytes/param (int8+zstd, naive)
+- SOTA: ~46M params → 0.35 bytes/param (int8+zstd, GPTQ)
+- Gap is partly GPTQ (more compressible rounding) and partly architecture (our cross-attn/conv layers compress worse)
+
+### Hierarchical architecture summary
+
+| Config | Params | BPB | Artifact | Fits 16MB? |
+|---|---|---|---|---|
+| 2L MLP×3, BS=1, 500 steps | 17.9M | 2.678 | ~6 MB | Yes |
+| 2L MLP×3, BS=512, 500 steps | 17.9M | 2.437 | ~7 MB | Yes |
+| 14L MLP×3, 2000 steps | 48.0M | 1.910* | 28.5 MB | No |
+| 4L MLP×6, 2000 steps | 36.2M | 1.686 | 19.6 MB | No |
+| **4L MLP×4, 5000 steps** | **27.3M** | **1.687** | **15.2 MB** | **Yes** |
+| 4L MLP×6, 5000 steps (GPTQ+pack) | 36.2M | 1.665 | 26.0 MB | No |
+
+*1cycle peak, not final
+
+**Key lessons from hierarchical exploration:**
+1. **Batched streaming was the biggest win** — 10× more training signal per step, GPU utilization from 10% to useful
+2. **Wider > deeper** for same param count — 2.5× faster per step, GPU parallelizes width
+3. **Warmdown schedule >> 1cycle** for long runs — 1cycle destabilizes, warmdown is monotonic
+4. **LR=0.015 is stable for 5000+ steps** at BS=512; LR=0.03 diverges after ~2500
+5. **6-bit packing hurts** — zstd already handles the wasted bits efficiently
+6. **Artifact constraint is the binding limit** — int6+zstd gives ~0.5 bytes/param trained, limiting us to ~30M params for 16MB
+7. **Still 0.55 BPB behind standard GPT** (1.687 vs 1.171) — the 75% loss efficiency (192/256 tokens) and smaller model are the root causes
+
+---
+
+## Overnight Experiment Suite (2026-04-06)
+
+SOTA-like baseline + 10 ideas. All: 11L, MLP×3, dim=512, XSA-all, LeakyReLU², seq=2048, compiled, 1000 steps, 1×A100 SXM.
+
+| # | Experiment | BPB | vs baseline | Artifact | Notes |
+|---|---|---|---|---|---|
+| 0 | **Baseline** (warmdown) | 1.330 | — | 15.9 MB | SOTA-like config |
+| 1 | +SSE calibration | 1.320 | **-0.010** | 15.5 MB | Cheap win, only 33K params |
+| 2 | +Lloyd-Max quant | 2.145 | -0.815 | 16.0 MB | Broken — STE_TYPE doesn't work with int6 post-train |
+| 3 | Smaller batch (262K) | 1.331 | -0.001 | 15.7 MB | Neutral — more steps but noisier gradient |
+| 4 | **1cycle LR** | **1.311** | **-0.019** | 14.1 MB | Best single idea. Also smallest artifact. |
+| 5 | +BigramHash | 1.334 | +0.004 | 16.3 MB | Slightly worse + larger artifact |
+| 6 | MLP×4, 9L | 1.329 | -0.001 | 15.7 MB | Neutral — wider but shallower cancels out |
+| 7 | 13L (deeper) | 1.331 | +0.001 | 15.7 MB | Neutral at 1000 steps |
+| 8 | seq=4096 | 1.330 | +0.000 | 16.0 MB | No help — longer seq doesn't help at 1000 steps |
+| 9 | +EMA | 1.876 | -0.546 | 12.2 MB | **Catastrophic** — confirmed: EMA + quantization = disaster |
+| 10 | **Combo** (1cycle+SSE+BigramHash) | **1.299** | **-0.031** | 14.3 MB | Best result. 1cycle + SSE stack. BigramHash might be hurting slightly. |
+
+Key findings:
+- **1cycle LR is the single biggest win** (-0.019 over warmdown at 1000 steps)
+- **SSE calibration stacks** with 1cycle for combo -0.031
+- **EMA is catastrophic** with quantization — confirmed again (DO NOT USE)
+- **BigramHash slightly hurts** at 1000 steps — may need more steps or tuning
+- **Lloyd-Max needs different integration** — STE_TYPE env var doesn't apply to post-training int6
+- Deeper (13L) and wider (MLP×4) are neutral at 1000 steps — need more steps to differentiate
+- Smaller artifact with 1cycle (14.1 MB) — weights are more compressible because 1cycle's cosine cooldown produces smoother weight distributions
+
+**Novel ideas suite** (implemented + tested, same SOTA-like config, 1000 steps, 1×A100 SXM):
+
+| # | Experiment | BPB | vs baseline | Artifact | Notes |
+|---|---|---|---|---|---|
+| 0 | Baseline (warmdown) | 1.331 | — | 15.6 MB | |
+| 5 | Foveated attn (top 4L, w=256) | 0.002 | — | 15.8 MB | **BUG: information leak** in windowed mask. Invalid result. |
+| 6 | Adaptive depth (per-token gate) | 1.350 | +0.019 | 16.2 MB | Hurts — gates add params + overhead, no compute saved at 1000 steps |
+| 7a | MoE 4-expert, 5L | 1.333 | +0.002 | 43.3 MB | Neutral BPB, massive artifact — too many expert params |
+| 7b | MoE 2-expert, 11L | 1.331 | +0.000 | 25.5 MB | Neutral — 2× MLP params but only 1 active, artifact too large |
+| 8 | Distill teacher (16L, 500 steps) | 1.440 | — | — | Teacher only. Student distillation not implemented. |
+| 9 | Embed bottleneck (dim=128→512) | 1.347 | +0.016 | 15.4 MB | Hurts — bottleneck embedding loses information |
+| 10 | Federated avg (sync every 200) | 1.329 | **-0.002** | 15.5 MB | Tiny improvement — needs multi-GPU to truly test |
+
+Novel idea findings:
+- **Foveated attention has a bug** — windowed mask leaks future tokens. Need to fix and retest.
+- **MoE doesn't help at constant artifact budget** — experts add params but artifact grows proportionally. Would need mixed-precision (inactive experts at lower bits) to be artifact-efficient.
+- **Adaptive depth hurts** — the gates learn to always use all layers (bias=2.0 → sigmoid≈0.88). At 1000 steps there's no compute saving. Might help at 5000+ steps where some tokens truly plateau early.
+- **Distillation incomplete** — teacher model is weaker than student would be (fewer steps). Needs training loop integration.
+- **Federated averaging shows tiny signal** — needs multi-GPU to properly test (on 1 GPU it just averages with itself).
+
+**Combined results (both suites):**
+
+Top techniques ranked by Δ BPB:
+1. **1cycle+SSE combo**: -0.031
+2. **1cycle LR alone**: -0.019
+3. **SSE calibration**: -0.010
+4. **Federated avg**: -0.002
+5. All others: neutral or negative
+
+**Next steps:**
+1. Run combo (1cycle+SSE) for full 4000+ steps on 8×H100 to see competition-scale result
+2. Try 1cycle+SSE without BigramHash (BigramHash may be hurting)
+3. Fix foveated attention bug and retest
+4. Fix Lloyd-Max integration for post-training quantization
+
+---
+
+## SOTA Reproduction (2026-04-07)
+
+Used actual PR #1019 `train_gpt_sota.py` (downloaded from GitHub, patched FA3→SDPA fallback).
+
+**Training run** (1×H100 NVL, 7000 steps, no FlashAttention 3):
+
+| Step | BPB | ms/step |
+|---|---|---|
+| 500 | 1.408 | 1393 |
+| 1000 | 1.318 | 1392 |
+| 2000 | 1.256 | 1406 |
+| 3000 | 1.232 | 1406 |
+| 4000 | 1.208 | 1406 |
+| 5000 | 1.188 | 1405 |
+| 6000 | 1.164 | 1403 |
+| 6500 | 1.149 | 1403 |
+| **7000** | **1.138** | 1403 |
+| Post-EMA | 1.137 | |
+| **GPTQ roundtrip** | **1.141** | |
+| Sliding eval (est.) | ~1.116 | |
+| Artifact | 15.91 MB | |
+
+**Comparison with actual SOTA:**
+
+| Metric | SOTA (8×H100) | Our repro (1×H100) | Gap |
+|---|---|---|---|
+| Pre-quant | 1.135 | 1.138 | +0.003 |
+| GPTQ roundtrip | 1.138 | 1.141 | +0.003 |
+| GPTQ gap | +0.002 | +0.004 | |
+| Sliding eval | **1.115** | **~1.116** (est.) | ~+0.001 |
+
+**Reproduction is successful.** Small gaps from no FA3 and 1 vs 8 GPU.
+
+**BLOCKING ISSUE: Sliding eval crashes.** The SOTA script's post-training eval uses `torch.compile(eval_model)` which OOMs or segfaults after GPTQ. Multiple attempts to run sliding eval separately failed — the script's complex code structure (weight banks, unbanking/rebanking, mixed int6 quant format) makes it hard to load the artifact in a standalone eval script.
+
+**Next priority: Fix sliding eval.** This is needed before we can measure improvements. May require restructuring the eval code to be standalone.
 
 ---
 

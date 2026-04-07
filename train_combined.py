@@ -175,6 +175,16 @@ class Hyperparameters:
     ema_enabled = _e("EMA_ENABLED", 0, bool)
     ema_decay = _e("EMA_DECAY", 0.999, float)
     ema_start_frac = _e("EMA_START_FRAC", 0.1, float)
+    # Novel features (overnight experiments)
+    moe_experts = _e("MOE_EXPERTS", 0, int)  # 0=disabled, N=N expert MLPs per layer with top-1 routing
+    moe_topk = _e("MOE_TOPK", 1, int)
+    foveated_layers = _e("FOVEATED_LAYERS", 0, int)  # N top layers use windowed attention
+    foveated_window = _e("FOVEATED_WINDOW", 256, int)
+    adaptive_depth = _e("ADAPTIVE_DEPTH", 0, bool)  # learned per-token layer-skip gates
+    distill_from = _e("DISTILL_FROM", "")  # path to teacher model for distillation
+    distill_alpha = _e("DISTILL_ALPHA", 0.5, float)  # weight of distillation loss vs CE loss
+    structured_embed = _e("STRUCTURED_EMBED", 0, bool)  # byte-level embedding composition
+    progressive_merge = _e("PROGRESSIVE_MERGE", 0, bool)  # train 2 branches, merge midway
 
 CTP = ("attn_scale","attn_scales","mlp_scale","mlp_scales","resid_mix","resid_mixes","q_gain","diff_lambda","skip_weight","skip_weights","vocab_bias","refiner.gate","ngram_injector.stat_weights","ngram_injector.input_scale","ngram_injector.layer_scales","ngram_logit_mixer.logit_boost","ngram_logit_mixer.gate","xsa_gate","bigram_logit_mixer.gate","sse.token_scale","sse.cluster_bias","sse.entropy_temp","context_logit_bias.")
 
@@ -1670,6 +1680,57 @@ class TokenShiftMixer(nn.Module):
         return self.proj_out(F.silu(gate) * val)
 
 
+# ---------------------------------------------------------------------------
+# Novel features: MoE, Foveated Attention, Adaptive Depth
+# ---------------------------------------------------------------------------
+
+class MoEMLP(nn.Module):
+    """Mixture of Experts MLP: N small expert MLPs with top-k routing.
+    Total params = N × expert_params, but only top-k experts active per token.
+    More capacity per artifact byte since inactive expert weights compress well."""
+    def __init__(self, dim, mlp_mult, num_experts, topk=1, group_size=64, activation="swiglu"):
+        super().__init__()
+        self.num_experts = num_experts
+        self.topk = topk
+        self.experts = nn.ModuleList([
+            MLP(dim, mlp_mult, group_size, activation) for _ in range(num_experts)
+        ])
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, D = x.shape
+        # Router: (B, T, num_experts)
+        logits = self.gate(x.float())
+        weights, indices = torch.topk(torch.softmax(logits, dim=-1), self.topk, dim=-1)  # (B, T, topk)
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # renormalize
+
+        # Dispatch to experts
+        out = torch.zeros_like(x)
+        for k in range(self.topk):
+            expert_idx = indices[:, :, k]  # (B, T)
+            w = weights[:, :, k].unsqueeze(-1).to(x.dtype)  # (B, T, 1)
+            for e in range(self.num_experts):
+                mask = (expert_idx == e)  # (B, T)
+                if mask.any():
+                    # Gather tokens for this expert
+                    expert_input = x[mask]  # (N, D)
+                    expert_out = self.experts[e](expert_input.unsqueeze(0)).squeeze(0)  # (N, D)
+                    out[mask] += (w[mask] * expert_out)
+        return out
+
+
+class AdaptiveDepthGate(nn.Module):
+    """Per-token gate that decides whether to skip this layer.
+    Output: gate * layer_output + (1-gate) * input (soft skip)."""
+    def __init__(self, dim):
+        super().__init__()
+        self.proj = nn.Linear(dim, 1, bias=True)
+        nn.init.constant_(self.proj.bias, 2.0)  # bias toward using the layer initially
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.sigmoid(self.proj(x.float())).to(x.dtype)  # (B, T, 1)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, group_size: int=64,
@@ -1678,10 +1739,13 @@ class Block(nn.Module):
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn: bool=False, mlp_groups: int=0, xsa: bool=False,
-                 mixer_type: str="attention"):
+                 mixer_type: str="attention", moe_experts: int=0, moe_topk: int=1,
+                 adaptive_depth: bool=False, foveated: bool=False, foveated_window: int=256):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
+        self.foveated = foveated
+        self.foveated_window = foveated_window
         if mixer_type == "causal_conv":
             self.attn = CausalConvMixer(dim, kernel_size=32, group_size=group_size)
         elif mixer_type == "token_shift":
@@ -1691,7 +1755,11 @@ class Block(nn.Module):
                                             group_size, attn_proj_type, tversky_num_features,
                                             tversky_feature_pools, no_cache, rope_type, yarn_max_len,
                                             train_seq_len, tversky_membership, diff_attn, xsa=xsa)
-        self.mlp = MLP(dim, mlp_mult, group_size, activation, mlp_groups)
+        if moe_experts > 0:
+            self.mlp = MoEMLP(dim, mlp_mult, moe_experts, moe_topk, group_size, activation)
+        else:
+            self.mlp = MLP(dim, mlp_mult, group_size, activation, mlp_groups)
+        self.depth_gate = AdaptiveDepthGate(dim) if adaptive_depth else None
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1699,13 +1767,47 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor, causal: bool = True) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
-        n = self.attn_norm(x)
-        x = x + self.attn_scale.to(dtype=x.dtype) * self.attn(n, causal=causal)
-        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
+        x_in = mix[0] * x + mix[1] * x0
+        n = self.attn_norm(x_in)
+        # Foveated: use windowed causal attention (only attend to last W tokens)
+        if self.foveated and hasattr(self.attn, 'c_qkv'):
+            B, T, D = n.shape
+            W = self.foveated_window
+            if T > W:
+                # Create windowed causal mask: each token attends to at most W previous tokens
+                mask = torch.ones(T, T, dtype=torch.bool, device=n.device).tril()
+                mask = mask & (torch.arange(T, device=n.device).unsqueeze(0) - torch.arange(T, device=n.device).unsqueeze(1) < W)
+                float_mask = torch.where(mask, 0.0, float('-inf')).unsqueeze(0).unsqueeze(0)
+                # Use SDPA path with mask (bypass flash_attn)
+                qkv = self.attn.c_qkv(n)
+                H, KVH = self.attn.num_heads, self.attn.num_kv_heads
+                head_dim = D // H
+                q = qkv[:, :, :D].reshape(B, T, H, head_dim).transpose(1, 2)
+                k = qkv[:, :, D:D + KVH * head_dim].reshape(B, T, KVH, head_dim).transpose(1, 2)
+                v = qkv[:, :, D + KVH * head_dim:].reshape(B, T, KVH, head_dim).transpose(1, 2)
+                if KVH != H:
+                    rep = H // KVH
+                    k = k.unsqueeze(3).expand(B, KVH, T, rep, head_dim).reshape(B, H, T, head_dim)
+                    v = v.unsqueeze(3).expand(B, KVH, T, rep, head_dim).reshape(B, H, T, head_dim)
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=float_mask)
+                attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
+                attn_out = self.attn.proj(attn_out)
+                if hasattr(self.attn, 'xsa') and self.attn.xsa:
+                    gate = torch.sigmoid(self.attn.xsa_gate.to(dtype=attn_out.dtype))
+                    attn_out = gate * attn_out
+                x_out = x_in + self.attn_scale.to(dtype=x_in.dtype) * attn_out
+            else:
+                x_out = x_in + self.attn_scale.to(dtype=x_in.dtype) * self.attn(n, causal=causal)
+        else:
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype) * self.attn(n, causal=causal)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype) * self.mlp(self.mlp_norm(x_out))
         if self.smear is not None:
-            x = self.smear(x)
-        return x
+            x_out = self.smear(x_out)
+        # Adaptive depth: soft skip
+        if self.depth_gate is not None:
+            gate = self.depth_gate(x_in)
+            x_out = gate * x_out + (1 - gate) * x_in
+        return x_out
 
 class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads, mlp_mult,
@@ -1789,6 +1891,17 @@ class GPT(nn.Module):
         else:
             self.tversky_feature_pools_list = None
 
+        # Novel feature flags (set via _set_novel_features before construction)
+        if not hasattr(self, '_moe_experts'):
+            self._moe_experts = 0
+        if not hasattr(self, '_moe_topk'):
+            self._moe_topk = 1
+        if not hasattr(self, '_adaptive_depth'):
+            self._adaptive_depth = False
+        if not hasattr(self, '_foveated_layers'):
+            self._foveated_layers = 0
+        if not hasattr(self, '_foveated_window'):
+            self._foveated_window = 256
         # Universal Transformer: create fewer unique blocks, iterate them.
         self.ut_iters = ut_iters if ut_unique_blocks > 0 else 1
         actual_blocks = ut_unique_blocks if ut_unique_blocks > 0 else num_layers
@@ -1797,7 +1910,11 @@ class GPT(nn.Module):
                   group_size, activation, attn_proj_type, tversky_num_features, tversky_feature_pools,
                   no_cache, smear, rope_type, yarn_max_len, train_seq_len, tversky_membership,
                   diff_attn, mlp_groups, xsa=(i >= actual_blocks - xsa_layers),
-                  mixer_type=mixer_type)
+                  mixer_type=mixer_type,
+                  moe_experts=self._moe_experts, moe_topk=self._moe_topk,
+                  adaptive_depth=self._adaptive_depth,
+                  foveated=(i >= actual_blocks - self._foveated_layers),
+                  foveated_window=self._foveated_window)
             for i in range(actual_blocks)
         ])
 
@@ -2321,7 +2438,31 @@ def main(return_model: bool = False, boost_model: "GPT | None" = None) -> "GPT |
         clb_context_len=args.clb_context_len, clb_rank=args.clb_rank,
         xsa_layers=args.xsa_layers, mixer_type=args.mixer_type,
         ut_unique_blocks=args.ut_unique_blocks, ut_iters=args.ut_iters,
-    ).to(device).bfloat16()
+    )
+    # Set novel feature flags BEFORE .to(device) triggers parameter init
+    base_model._moe_experts = args.moe_experts
+    base_model._moe_topk = args.moe_topk
+    base_model._adaptive_depth = args.adaptive_depth
+    base_model._foveated_layers = args.foveated_layers
+    base_model._foveated_window = args.foveated_window
+    # Now rebuild blocks with novel features if any are enabled
+    if args.moe_experts > 0 or args.adaptive_depth or args.foveated_layers > 0:
+        actual_blocks = args.ut_unique_blocks if args.ut_unique_blocks > 0 else args.num_layers
+        base_model.blocks = nn.ModuleList([
+            Block(args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult,
+                  args.rope_base, args.qk_gain_init, args.bitnet_group_size, args.activation_type,
+                  args.attn_proj_type, args.tversky_num_features, args.tversky_feature_pools,
+                  (args.compile_mode == "reduce-overhead"), args.smear, args.rope_type,
+                  args.yarn_max_len, args.train_seq_len, args.tversky_membership,
+                  args.diff_attn, args.mlp_groups, xsa=(i >= actual_blocks - args.xsa_layers),
+                  mixer_type=args.mixer_type,
+                  moe_experts=args.moe_experts, moe_topk=args.moe_topk,
+                  adaptive_depth=args.adaptive_depth,
+                  foveated=(i >= actual_blocks - args.foveated_layers),
+                  foveated_window=args.foveated_window)
+            for i in range(actual_blocks)
+        ])
+    base_model = base_model.to(device).bfloat16()
 
     # Load precomputed n-gram tables if available.
     if args.ngram_enabled and args.ngram_table_path and (base_model.ngram_injector is not None or base_model.ngram_logit_mixer is not None):

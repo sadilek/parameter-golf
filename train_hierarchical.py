@@ -45,7 +45,8 @@ class Hyperparameters:
     val_loss_every = _e("VAL_LOSS_EVERY", 500, int)
     train_log_every = _e("TRAIN_LOG_EVERY", 10, int)
     iterations = _e("ITERATIONS", 2000, int)
-    lr_schedule = _e("LR_SCHEDULE", "1cycle")
+    lr_schedule = _e("LR_SCHEDULE", "warmdown")
+    warmdown_iters = _e("WARMDOWN_ITERS", 1200, int)
     onecycle_peak_frac = _e("ONECYCLE_PEAK_FRAC", 0.3, float)
     onecycle_min_div = _e("ONECYCLE_MIN_DIV", 4.0, float)
     train_batch_tokens = _e("TRAIN_BATCH_TOKENS", 524288, int)
@@ -73,6 +74,7 @@ class Hyperparameters:
     muon_momentum_warmup_start = _e("MUON_MOMENTUM_WARMUP_START", 0.85, float)
     muon_momentum_warmup_steps = _e("MUON_MOMENTUM_WARMUP_STEPS", 500, int)
     muon_backend_steps = _e("MUON_BACKEND_STEPS", 5, int)
+    batch_size = _e("BATCH_SIZE", 8, int)
     muon_wd = _e("MUON_WD", 0.0, float)
     beta1 = _e("BETA1", 0.9, float)
     beta2 = _e("BETA2", 0.95, float)
@@ -86,7 +88,7 @@ class Hyperparameters:
 
 
 # ---------------------------------------------------------------------------
-# Int6 quantization
+# Quantization: GPTQ + 6-bit packing
 # ---------------------------------------------------------------------------
 INT6_RANGE = 31
 INT6_KEEP_FLOAT_PATTERNS = ("tok_emb", "lm_head", "embed_proj")
@@ -105,20 +107,167 @@ def quantize_int6(t: Tensor, quant_range: int = INT6_RANGE, clip_q: float = 0.99
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale.float()), -127, 127).to(torch.int8)
     return q.contiguous(), scale.contiguous()
 
-def q_sd_int6(state_dict: dict, clip_q: float = 0.9999984) -> tuple[dict, dict]:
-    result, stats = {}, {"int6_params": 0, "int8_params": 0, "fp_params": 0}
+
+def gptq_quantize_matrix(W: Tensor, H: Tensor, quant_range: int = 31,
+                          blocksize: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
+    """GPTQ: quantize weight matrix W using Hessian H = X^T X from calibration data."""
+    dev = H.device
+    W = W.float().clone().to(dev)
+    rows, cols = W.shape
+
+    damp = percdamp * H.diag().mean()
+    diag_idx = torch.arange(cols, device=dev)
+    H = H.clone()
+    H[diag_idx, diag_idx] += damp
+
+    try:
+        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+    except Exception:
+        H_inv = torch.linalg.pinv(H)
+    try:
+        Hinv_cho = torch.linalg.cholesky(H_inv, upper=True)
+    except Exception:
+        Hinv_cho = torch.linalg.cholesky(H_inv + 1e-6 * torch.eye(cols, device=dev), upper=True)
+
+    scale = W.abs().amax(dim=1).clamp_min(1e-8) / quant_range
+    Q = torch.zeros_like(W, dtype=torch.int8)
+
+    for i1 in range(0, cols, blocksize):
+        i2 = min(i1 + blocksize, cols)
+        W_block = W[:, i1:i2].clone()
+        Hinv_block = Hinv_cho[i1:i2, i1:i2]
+
+        for i in range(i2 - i1):
+            w = W_block[:, i]
+            d = Hinv_block[i, i]
+            q = (w / scale).round().clamp(-quant_range, quant_range)
+            Q[:, i1 + i] = q.to(torch.int8)
+            err = (w - q * scale) / d
+            W_block[:, i:] -= err.unsqueeze(1) * Hinv_block[i, i:].unsqueeze(0)
+
+        if i2 < cols:
+            W[:, i2:] -= (W[:, i1:i2] - Q[:, i1:i2].float() * scale.unsqueeze(1)) @ Hinv_cho[i1:i2, i2:]
+
+    return Q.cpu(), scale.cpu().half()
+
+
+class HessianCollector:
+    """Collects H = X^T X for a linear layer's inputs during forward passes."""
+    def __init__(self):
+        self.H = None
+        self.n_samples = 0
+        self.hook = None
+
+    def hook_fn(self, module, input, output):
+        x = input[0]
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        x = x.float()
+        if self.H is None:
+            self.H = torch.zeros(x.shape[1], x.shape[1], device=x.device)
+        self.H.addmm_(x.T, x)
+        self.n_samples += x.shape[0]
+
+    def register(self, module):
+        self.hook = module.register_forward_hook(self.hook_fn)
+
+    def remove(self):
+        if self.hook:
+            self.hook.remove()
+
+    def get_H(self):
+        return self.H / max(self.n_samples, 1) if self.H is not None else None
+
+
+def collect_hessians(model, val_tokens, device, total_seq, n_calib_tokens=131072):
+    """Collect Hessians for all quantizable linear layers via calibration forward passes."""
+    collectors = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and module.weight.numel() > 4096:
+            if not any(p in name for p in INT6_KEEP_FLOAT_PATTERNS):
+                c = HessianCollector()
+                c.register(module)
+                collectors[name] = c
+
+    model.eval()
+    n_seqs = min(n_calib_tokens // total_seq, (val_tokens.numel() - 1) // total_seq)
+    with torch.inference_mode():
+        for i in range(n_seqs):
+            x = val_tokens[i * total_seq:(i + 1) * total_seq].unsqueeze(0).to(device=device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _ = model(x)
+    model.train()
+
+    hessians = {}
+    for name, c in collectors.items():
+        H = c.get_H()
+        if H is not None:
+            hessians[name] = H
+        c.remove()
+    return hessians
+
+
+def pack_int6(q: Tensor) -> Tensor:
+    """Pack int6 values (stored as int8, range [-31,31]) into 6 bits per value.
+    Packs 4 values into 3 bytes. Input length must be divisible by 4.
+    Values shifted to unsigned [0,62] before packing."""
+    flat = (q.flatten().to(torch.int16) + 31).to(torch.uint8)  # [0, 62], fits in 6 bits
+    n = flat.numel()
+    assert n % 4 == 0, f"pack_int6 requires length divisible by 4, got {n}"
+    flat = flat.reshape(-1, 4)
+    a, b, c, d = flat[:, 0], flat[:, 1], flat[:, 2], flat[:, 3]
+    # Pack 4×6bit = 24bit = 3 bytes: [aaaaaa|bb bbbb|cccc cc|dddddd] → byte0=a<<2|b>>4, byte1=(b&0xF)<<4|c>>2, byte2=(c&3)<<6|d
+    b0 = (a << 2) | (b >> 4)
+    b1 = ((b & 0x0F) << 4) | (c >> 2)
+    b2 = ((c & 0x03) << 6) | d
+    packed = torch.stack([b0, b1, b2], dim=1).reshape(-1)
+    return packed.contiguous()
+
+
+def unpack_int6(packed: Tensor, n_values: int) -> Tensor:
+    """Unpack 6-bit packed values back to int8 in [-31,31]."""
+    packed = packed.reshape(-1, 3)
+    b0, b1, b2 = packed[:, 0].to(torch.int16), packed[:, 1].to(torch.int16), packed[:, 2].to(torch.int16)
+    a = (b0 >> 2) & 0x3F
+    b = ((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)
+    c = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)
+    d = b2 & 0x3F
+    flat = torch.stack([a, b, c, d], dim=1).reshape(-1)[:n_values]
+    return (flat.to(torch.int8) - 31).contiguous()
+
+
+def q_sd_gptq(state_dict: dict, hessians: dict, clip_q: float = 0.9999984) -> tuple[dict, dict]:
+    """Quantize state dict with GPTQ (where Hessians available) + 6-bit packing."""
+    result, stats = {}, {"gptq_params": 0, "naive_params": 0, "int8_params": 0, "fp_params": 0}
     for name, tensor in state_dict.items():
-        # Skip non-weight buffers (e.g. attention masks)
         if "mask" in name:
             result[name] = tensor.detach().cpu()
             continue
         t = tensor.detach().cpu().float().contiguous()
         is_keep_float = any(p in name for p in INT6_KEEP_FLOAT_PATTERNS)
+
         if t.ndim >= 2 and t.numel() > 4096 and not is_keep_float:
             t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
-            q, s = quantize_int6(t2d, INT6_RANGE, clip_q)
-            result[name + ".q"], result[name + ".s"], result[name + ".shape"] = q, s, torch.tensor(list(t.shape))
-            stats["int6_params"] += t.numel()
+            module_name = name.replace(".weight", "")
+            H = hessians.get(module_name)
+
+            if H is not None and H.shape[0] == t2d.shape[1]:
+                q, s = gptq_quantize_matrix(t2d, H, quant_range=INT6_RANGE)
+                stats["gptq_params"] += t.numel()
+            else:
+                q, s = quantize_int6(t2d, INT6_RANGE, clip_q)
+                stats["naive_params"] += t.numel()
+
+            # 6-bit pack: pad total values to multiple of 4
+            rows, cols = q.shape
+            pad = (4 - cols % 4) % 4
+            if pad > 0:
+                q = torch.cat([q, torch.zeros(rows, pad, dtype=torch.int8)], dim=1)
+            packed = pack_int6(q)
+            result[name + ".p6"] = packed
+            result[name + ".s"] = s
+            result[name + ".shape"] = torch.tensor(list(t.shape))  # original shape (may be 3D+)
+
         elif t.ndim >= 2 and t.numel() > 4096 and is_keep_float:
             t2d = t.reshape(t.shape[0], -1) if t.ndim > 2 else t
             q, s = quantize_int6(t2d, INT8_RANGE, clip_q)
@@ -129,18 +278,36 @@ def q_sd_int6(state_dict: dict, clip_q: float = 0.9999984) -> tuple[dict, dict]:
             stats["fp_params"] += t.numel()
     return result, stats
 
-def deq_sd_int6(obj: dict, target_dtype=torch.bfloat16) -> dict:
+
+def deq_sd(obj: dict, target_dtype=torch.bfloat16) -> dict:
+    """Dequantize: handles both packed int6 (.p6) and unpacked int8 (.q) formats."""
     out, processed = {}, set()
     for key in list(obj.keys()):
-        if key.endswith(".q"):
-            name = key[:-2]
+        if key.endswith(".p6"):
+            name = key[:-3]
             processed.add(name)
-            q, s, shape = obj[name + ".q"].float(), obj[name + ".s"].float(), obj[name + ".shape"].tolist()
-            t = (q * s[:, None]).to(target_dtype) if s.ndim > 0 else (q * s).to(target_dtype)
-            out[name] = t.reshape(shape).contiguous()
+            orig_shape = obj[name + ".shape"].tolist()
+            s = obj[name + ".s"].float()
+            # Flatten to 2D for dequant (rows × cols), same as quantization
+            rows = orig_shape[0]
+            cols = 1
+            for d in orig_shape[1:]:
+                cols *= d
+            pad = (4 - cols % 4) % 4
+            total_values = rows * (cols + pad)
+            q = unpack_int6(obj[name + ".p6"], total_values).reshape(rows, cols + pad)[:, :cols].float()
+            out[name] = (q * s[:, None]).to(target_dtype).reshape(orig_shape).contiguous()
+        elif key.endswith(".q"):
+            name = key[:-2]
+            if name not in processed:
+                processed.add(name)
+                q, s = obj[name + ".q"].float(), obj[name + ".s"].float()
+                shape = obj[name + ".shape"].tolist()
+                t = (q * s[:, None]).to(target_dtype) if s.ndim > 0 else (q * s).to(target_dtype)
+                out[name] = t.reshape(shape).contiguous()
     for key, val in obj.items():
-        name = key.removesuffix(".q").removesuffix(".s").removesuffix(".shape")
-        if name not in processed and not key.endswith((".q", ".s", ".shape")):
+        base = key.removesuffix(".p6").removesuffix(".q").removesuffix(".s").removesuffix(".shape")
+        if base not in processed and not key.endswith((".p6", ".q", ".s", ".shape")):
             out[key] = val.to(target_dtype).contiguous()
     return out
 
@@ -593,107 +760,126 @@ def eval_val(args, model, rank, world_size, device, val_tokens,
 # ---------------------------------------------------------------------------
 # Streaming training
 # ---------------------------------------------------------------------------
-class StreamingTrainer:
-    """Manages per-rank contiguous token stream + convnet cache for streaming training.
+class BatchedStreamingTrainer:
+    """Batched streaming trainer: B independent token streams with tensor-based caches.
 
-    Data flow per step (after cold start):
-      1. Old prediction window becomes newest context window → encode with convnet (1 pass, with grad)
-      2. Drop oldest cached context window
-      3. Read window_size new tokens from stream → new prediction window
-      4. Assemble 15 cached (detached) + 1 fresh encoded → run global transformer
-      5. Run local decoder on prediction window → loss on last pred_len tokens
-      6. Backward + step
-
-    On shard boundary or first step: cold start (encode all 15 context windows fresh).
+    Optimizations vs naive per-stream loop:
+    - Token reads: all on CPU, single bulk .to(device) transfer
+    - Cache: pre-allocated (B, n_ctx, model_dim) tensor, shift via roll + overwrite
+    - GPU ops: single batched call for tok_emb and encode_single_window
     """
 
-    def __init__(self, model: HierarchicalGPT, stream: TokenStream, device: torch.device,
-                 total_seq: int, window_size: int):
+    def __init__(self, model: HierarchicalGPT, streams: list[TokenStream],
+                 device: torch.device, total_seq: int, window_size: int):
         self.model = model
-        self.stream = stream
+        self.B = len(streams)
+        self.streams = streams
         self.device = device
         self.total_seq = total_seq
         self.window_size = window_size
         self.n_ctx = model.n_context_windows
-        self.cache: list[Tensor] = []  # list of (1, 1, model_dim) encoded windows
-        self.prev_pred_window: Tensor | None = None  # (1, window_size) token IDs
+        self.model_dim = model.model_dim
+        self.embed_dim = model.embed_dim
+        self.prefix_len = model.prefix_len
+        # Cache as contiguous tensor: (B, n_ctx, model_dim) on device, bfloat16 to match autocast
+        self.cache = torch.zeros(self.B, self.n_ctx, self.model_dim, device=device, dtype=torch.bfloat16)
+        self.cache_len = torch.zeros(self.B, dtype=torch.int32)  # how many valid entries per stream
+        # Previous prediction window tokens: (B, window_size) on device
+        self.prev_pred = torch.zeros(self.B, self.window_size, dtype=torch.int64, device=device)
+        self.has_prev = torch.zeros(self.B, dtype=torch.bool)  # which streams have valid prev
 
-    def _read(self, n: int) -> Tensor | None:
-        """Read exactly n contiguous tokens. Returns None if shard exhausted."""
-        tokens = self.stream.take(n)
+    def _read_cpu(self, stream_idx: int, n: int) -> Tensor | None:
+        """Read n tokens, stay on CPU. Returns None if shard exhausted."""
+        tokens = self.streams[stream_idx].take(n)
         if tokens.numel() < n:
-            self.stream.advance_shard()
+            self.streams[stream_idx].advance_shard()
             return None
-        return tokens.to(self.device, non_blocking=True).to(torch.int64)
+        return tokens.to(torch.int64)
 
-    def cold_start(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Read exactly total_seq contiguous tokens, encode all context windows.
+    def step(self) -> tuple[Tensor, Tensor, Tensor, int]:
+        """Advance all B streams. CPU reads batched, single GPU transfer, batched GPU ops."""
+        ws = self.window_size
 
-        Returns: (pred_emb, pred_targets, global_input) — same format as streaming_step,
-        so the training loop uses the same code path for both.
-        """
-        self.cache.clear()
-        while True:
-            tokens = self._read(self.total_seq)
-            if tokens is not None:
-                break
+        # 1. Classify + read tokens on CPU (no GPU transfers yet)
+        cold_ids = []
+        stream_ids = []
+        stream_tokens_list = []  # list of (ws,) CPU tensors
+        cold_tokens_list = []    # list of (total_seq,) CPU tensors
 
-        x = tokens.unsqueeze(0)  # (1, total_seq)
+        for b in range(self.B):
+            if self.has_prev[b] and self.cache_len[b] >= self.n_ctx:
+                tokens = self._read_cpu(b, ws)
+                if tokens is not None:
+                    stream_ids.append(b)
+                    stream_tokens_list.append(tokens)
+                else:
+                    self.has_prev[b] = False
+                    self.cache_len[b] = 0
+                    cold_ids.append(b)
+            else:
+                cold_ids.append(b)
 
+        for b in cold_ids:
+            self.cache_len[b] = 0
+            while True:
+                tokens = self._read_cpu(b, self.total_seq)
+                if tokens is not None:
+                    break
+            cold_tokens_list.append(tokens)
+
+        n_stream = len(stream_ids)
+        n_cold = len(cold_ids)
+
+        # 2. Single bulk CPU→GPU transfers (stack on CPU first, one transfer each)
+        if n_stream > 0:
+            s_idx = torch.tensor(stream_ids, dtype=torch.long)
+            new_pred_gpu = torch.stack(stream_tokens_list).to(self.device, non_blocking=True)
+        if n_cold > 0:
+            c_idx = torch.tensor(cold_ids, dtype=torch.long)
+            cold_gpu = torch.stack(cold_tokens_list).to(self.device, non_blocking=True)
+
+        # 3. Batched GPU ops for streaming streams
+        if n_stream > 0:
+            prev_batch = self.prev_pred[s_idx]  # (S, ws) — already on GPU
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                prev_emb = self.model.tok_emb(prev_batch)
+                fresh_enc = self.model.encode_single_window(prev_emb)  # (S, 1, model_dim)
+                new_emb = self.model.tok_emb(new_pred_gpu)              # (S, ws, embed_dim)
+
+            # Update cache: vectorized shift + write (no Python loop over B)
+            self.cache[s_idx, :-1] = self.cache[s_idx, 1:].clone()
+            self.cache[s_idx, -1] = fresh_enc[:, 0].detach()
+            self.prev_pred[s_idx] = new_pred_gpu
+
+        # 4. Batched GPU ops for cold starts
+        if n_cold > 0:
+            ctx_len = self.n_ctx * ws
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                cold_emb = self.model.tok_emb(cold_gpu)  # (C, total_seq, embed_dim)
+                ctx_emb = cold_emb[:, :ctx_len, :].reshape(-1, ws, self.embed_dim)
+                all_enc = self.model.encode_single_window(ctx_emb)  # (C*n_ctx, 1, model_dim)
+                all_enc = all_enc.reshape(n_cold, self.n_ctx, self.model_dim)
+
+            self.cache[c_idx] = all_enc.detach()
+            self.cache_len[c_idx] = self.n_ctx
+            self.has_prev[c_idx] = True
+            self.prev_pred[c_idx] = cold_gpu[:, ctx_len:ctx_len + ws]
+
+        # 5. Assemble final batched tensors (all B streams, original order)
+        # Global input from cache
+        global_in = self.cache.clone()  # (B, n_ctx, model_dim) — detached cache
+
+        # Prediction embeddings: need tok_emb on all B prev_pred windows
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            emb = self.model.tok_emb(x)
-            ctx_len = self.n_ctx * self.window_size
-            for i in range(self.n_ctx):
-                start = i * self.window_size
-                w_emb = emb[:, start:start + self.window_size, :]
-                self.cache.append(self.model.encode_single_window(w_emb))
+            # For streaming: we already computed new_emb; for cold: reuse cold_emb slice
+            # Simpler: just embed all B prev_pred windows (cheap, avoids complex indexing)
+            all_pred_emb = self.model.tok_emb(self.prev_pred)  # (B, ws, embed_dim)
 
-        self.prev_pred_window = x[:, ctx_len:ctx_len + self.window_size]
+        pred_targets = self.prev_pred[:, self.prefix_len:]  # (B, pred_len)
 
-        pred_emb = emb[:, ctx_len:ctx_len + self.window_size, :]
-        pred_targets = x[:, ctx_len + self.model.prefix_len:ctx_len + self.window_size]
-        global_input = torch.cat(self.cache, dim=1)
-        return pred_emb, pred_targets, global_input
-
-    def streaming_step(self) -> tuple[Tensor, Tensor, Tensor] | None:
-        """Read window_size new tokens for next prediction window.
-
-        Returns None if shard was exhausted (caller should cold-start).
-        Otherwise returns: (pred_emb, pred_targets, global_input)
-        """
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # 1. Encode old prediction window as new context window (WITH gradient)
-            prev_emb = self.model.tok_emb(self.prev_pred_window)
-            fresh_encoded = self.model.encode_single_window(prev_emb)
-
-        # 2. Update cache
-        if len(self.cache) >= self.n_ctx:
-            self.cache.pop(0)
-        self.cache = [c.detach() for c in self.cache]
-        self.cache.append(fresh_encoded)
-
-        # 3. Read exactly window_size tokens (no +1 needed — targets are within the window)
-        tokens = self._read(self.window_size)
-        if tokens is None:
-            self.cache.clear()
-            self.prev_pred_window = None
-            return None
-
-        pred_x = tokens.unsqueeze(0)  # (1, window_size)
-        pred_targets = pred_x[:, self.model.prefix_len:]  # (1, pred_len)
-
-        # 4. Embed and assemble
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred_emb = self.model.tok_emb(pred_x)
-        global_input = torch.cat(self.cache, dim=1)
-
-        # 5. Save for next step
-        self.prev_pred_window = pred_x
-
-        return pred_emb, pred_targets, global_input
-
-    def needs_cold_start(self) -> bool:
-        return len(self.cache) == 0 or self.prev_pred_window is None
+        return all_pred_emb, pred_targets, global_in, n_cold
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +890,8 @@ def main():
 
     # Compile ns_orth
     global ns_orth
-    ns_orth = torch.compile(ns_orth)
+    if args.compile_mode != "off":
+        ns_orth = torch.compile(ns_orth)
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -772,7 +959,7 @@ def main():
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"params:{n_params:,} ctx_windows:{base_model.n_context_windows} "
          f"d:{args.model_dim} gL:{args.n_global_layers} lL:{args.n_local_layers} "
-         f"h:{args.n_heads} ws:{world_size} ga:{grad_accum_steps}")
+         f"h:{args.n_heads} bs:{args.batch_size} ws:{world_size} ga:{grad_accum_steps}")
 
     # Compile (no DDP — Muon handles its own gradient sync, we manually all-reduce the rest)
     if args.compile_mode == "off":
@@ -820,7 +1007,19 @@ def main():
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float):
-        if args.lr_schedule == "1cycle":
+        if args.lr_schedule == "warmdown":
+            if args.warmdown_iters <= 0:
+                return 1.0
+            if max_wallclock_ms is None:
+                warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+                if warmdown_start <= step < args.iterations:
+                    return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+                return 1.0
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        elif args.lr_schedule == "1cycle":
             frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms is not None else step / max(args.iterations, 1)
             frac = min(frac, 1.0)
             min_mul = 1.0 / args.onecycle_min_div
@@ -832,16 +1031,23 @@ def main():
                 return min_mul + 0.5 * (1.0 - min_mul) * (1.0 + math.cos(math.pi * t))
         return 1.0
 
-    # Per-rank contiguous token stream + streaming trainer
-    stream = TokenStream.from_pattern(args.train_files, rank, world_size)
-    streamer = StreamingTrainer(base_model, stream, device, args.total_seq, args.window_size)
+    # Per-rank batched streaming trainer: B independent token streams
+    all_files = sorted(glob.glob(args.train_files))
+    my_files = all_files[rank::world_size] or all_files
+    streams = []
+    for b in range(args.batch_size):
+        # Rotate starting file so each stream in the batch reads different data
+        rotated = my_files[(b * len(my_files) // args.batch_size) % len(my_files):] + \
+                  my_files[:(b * len(my_files) // args.batch_size) % len(my_files)]
+        streams.append(TokenStream(rotated))
+    streamer = BatchedStreamingTrainer(base_model, streams, device, args.total_seq, args.window_size)
 
     # --- Compiler warmup (uses cold-start full forward) ---
     if args.warmup_steps > 0:
         log0(f"compiler warmup: {args.warmup_steps} steps")
         for _ in range(args.warmup_steps):
             zero_grad_all()
-            pred_emb, pred_targets, global_input = streamer.cold_start()
+            pred_emb, pred_targets, global_input, _ = streamer.step()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 gc = base_model.run_global_transformer(global_input)
                 logits = base_model.decode_local(pred_emb, gc)
@@ -850,8 +1056,9 @@ def main():
         zero_grad_all()
         for opt in optimizers:
             opt.state.clear()
-        streamer.cache.clear()
-        streamer.prev_pred_window = None
+        streamer.cache.zero_()
+        streamer.cache_len.zero_()
+        streamer.has_prev.zero_()
         log0("warmup done")
 
     # --- Training loop ---
@@ -889,18 +1096,11 @@ def main():
 
         zero_grad_all()
 
-        # Gradient accumulation: multiple streaming steps per optimizer step
+        # Gradient accumulation: grad_accum_steps × batch_size streams per optimizer step
         for _micro in range(grad_accum_steps):
-            result = None
-            if not streamer.needs_cold_start():
-                result = streamer.streaming_step()
-                if result is None:
-                    log0(f"step:{step} shard exhausted — cold start", console=False)
-            if result is None:
-                result = streamer.cold_start()
-                cold_starts += 1
+            pred_emb, pred_targets, global_input, cold = streamer.step()
+            cold_starts += cold
 
-            pred_emb, pred_targets, global_input = result
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 global_context = base_model.run_global_transformer(global_input)
                 logits = base_model.decode_local(pred_emb, global_context)
@@ -940,8 +1140,11 @@ def main():
             torch.save(sd, float_path)
             log0(f"saved float weights: {float_path} ({os.path.getsize(float_path)/1e6:.1f}MB)")
 
-        # Quantize and save artifact
-        q_sd, q_stats = q_sd_int6(sd, clip_q=args.int6_clip_q)
+        # GPTQ calibration + quantize with 6-bit packing
+        log0("collecting Hessians for GPTQ...")
+        hessians = collect_hessians(base_model, val_tokens, device, args.total_seq)
+        log0(f"  collected {len(hessians)} Hessians")
+        q_sd, q_stats = q_sd_gptq(sd, hessians, clip_q=args.int6_clip_q)
         log0(f"quant stats: {q_stats}")
 
         artifact_buf = io.BytesIO()
@@ -967,7 +1170,7 @@ def main():
 
         # Roundtrip eval
         log0("roundtrip eval...")
-        rt_sd = deq_sd_int6(q_sd, target_dtype=torch.bfloat16)
+        rt_sd = deq_sd(q_sd, target_dtype=torch.bfloat16)
         base_model.load_state_dict(rt_sd, strict=True)
         for module in base_model.modules():
             if isinstance(module, (nn.Linear, nn.Conv1d)):
