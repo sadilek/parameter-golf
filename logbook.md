@@ -806,9 +806,74 @@ Used actual PR #1019 `train_gpt_sota.py` (downloaded from GitHub, patched FA3→
 
 **Reproduction is successful.** Small gaps from no FA3 and 1 vs 8 GPU.
 
-**BLOCKING ISSUE: Sliding eval crashes.** The SOTA script's post-training eval uses `torch.compile(eval_model)` which OOMs or segfaults after GPTQ. Multiple attempts to run sliding eval separately failed — the script's complex code structure (weight banks, unbanking/rebanking, mixed int6 quant format) makes it hard to load the artifact in a standalone eval script.
+~~**BLOCKING ISSUE: Sliding eval crashes.**~~ **RESOLVED** — see below.
 
-**Next priority: Fix sliding eval.** This is needed before we can measure improvements. May require restructuring the eval code to be standalone.
+---
+
+## Sliding Eval Fix (2026-04-07)
+
+Created `eval_sota.py` — standalone eval script that loads GPTQ artifact and runs both standard + sliding eval with torch.compile.
+
+**Root causes of previous crashes (in old `eval_sliding.py` / `eval_sliding_simple.py`):**
+1. Wrong function names (`dequantize_int6` → should be `dequantize_mixed_int6`, `build_bpb_luts` → `build_sentencepiece_luts`, `load_val_tokens` → `load_validation_tokens`)
+2. Missing unbank→dequantize→rebank pipeline (tried to load weights directly into banked model)
+3. `exec` split on `"\ndef main():"` which didn't match `"def main() -> None:"` — accidentally ran the entire training script
+
+**The "OOM" was a red herring.** In standalone eval with a single model, torch.compile works fine (~923 MB / 80 GB GPU). The SOTA script's training-time eval had two models in memory, but that's not the fundamental issue.
+
+**Verified on 1×A100 SXM (1000-step test model):**
+
+| Eval | eval_sota.py | SOTA script | Match? |
+|---|---|---|---|
+| Standard BPB | 1.3988 | 1.3982 | Yes (float rounding) |
+| Sliding (s=64) BPB | 1.3744 | 1.3746 | Yes |
+| Delta | -0.0245 | -0.0236 | Yes |
+
+torch.compile works. Sliding eval takes ~1880s on 1×A100 (includes compile time). The `-0.025 BPB` free improvement is confirmed.
+
+**Usage:** `python eval_sota.py final_model.int6.ptz` (compile on by default, `BATCH_SEQS=8`, `NO_COMPILE_EVAL=1` to disable)
+
+---
+
+## Phase 1: 1cycle LR on SOTA Model (2026-04-08)
+
+**Hypothesis:** 1cycle LR was our best measured technique (-0.019 BPB on our model). Test if it transfers to the SOTA architecture.
+
+**Setup:** A/B test, SOTA config (11L, 512d, 8H/4KV GQA, BigramHash 3072×112, XSA-all, LeakyReLU²), 1000 steps, 1×A100 SXM.
+- Run A: Baseline warmdown (warmdown_iters=200)
+- Run B: 1cycle (peak_frac=0.3, min_div=4) via `train_gpt_sota_1cycle.py`
+
+**Step-by-step BPB:**
+
+| Step | Baseline | 1cycle | Delta |
+|------|----------|--------|-------|
+| 200 | 1.6265 | 1.6355 | +0.009 |
+| 400 | 1.4515 | 1.4479 | -0.004 |
+| 600 | 1.3875 | **1.3690** | **-0.019** |
+| 800 | 1.3547 | **1.3331** | **-0.022** |
+| 1000 | **1.2992** | 1.3253 | +0.026 |
+
+**Full results:**
+
+| Metric | Baseline | 1cycle | Delta |
+|--------|----------|--------|-------|
+| Pre-quant BPB | **1.2992** | 1.3253 | +0.026 (worse) |
+| GPTQ roundtrip | **1.3982** | 1.4060 | +0.008 (worse) |
+| GPTQ gap | 0.099 | 0.081 | -0.018 (1cycle quantizes better) |
+| Sliding (s=64) | **1.3746** | 1.3813 | +0.007 (worse) |
+
+**Verdict: 1cycle does NOT transfer to the SOTA model.** ❌
+
+1cycle is better at steps 600-800 (when its peak LR enables faster exploration), but the cosine anneal kills the LR too early. By step 800, 1cycle's LR is near its minimum (0.25× base), while the baseline still has full LR until step 800 and makes rapid progress during warmdown.
+
+**Why it worked on our model but not here:**
+- Our overnight experiments used `train_combined.py` with different architecture (13L), different optimizer config, and measured at a fixed 1000 steps where 1cycle happened to align well with the warmdown start
+- The SOTA's Muon optimizer with momentum warmup (0.92→0.99 over 1500 steps) already provides the "warm start" effect that 1cycle gives
+- The 1cycle cosine anneal competing with warmdown is wasteful — both try to reduce LR in the late phase but on different schedules
+
+**One positive:** 1cycle produces more quantization-friendly weights (GPTQ gap 0.081 vs 0.099, saving 0.018 BPB in the quant step). This partially compensates but doesn't overcome the worse pre-quant BPB.
+
+**Next:** SSE calibration (-0.010 BPB) is the remaining technique with measured positive delta. Or: consider entirely different angles (custom tokenizer, TTT, SLOT).
 
 ---
 
