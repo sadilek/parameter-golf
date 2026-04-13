@@ -66,6 +66,11 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_type = os.environ.get("MLP_TYPE", "standard")  # "standard" or "bottleneck"
+    bottleneck_dim = int(os.environ.get("BOTTLENECK_DIM", 0))  # 0 = auto (model_dim // 4)
+    # Comma-separated layer indices to use recurrent mixer instead of attention.
+    # e.g. "0,1,2" makes the first 3 layers recurrent, rest attention.
+    recurrent_layers = os.environ.get("RECURRENT_LAYERS", "")
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -617,6 +622,78 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BottleneckMLP(nn.Module):
+    """Two-stage MLP with a bottleneck for more nonlinearity per parameter.
+
+    Instead of one wide hidden layer, routes through a narrow bottleneck then
+    expands to an even wider hidden. For the same param budget as standard MLP,
+    the wider hidden + extra activation gives more expressive capacity.
+
+    Standard:   dim -> hidden -> dim              (1 nonlinearity)
+    Bottleneck: dim -> neck -> wide_hidden -> dim  (2 nonlinearities)
+    """
+    def __init__(self, dim: int, mlp_mult: int, bottleneck_dim: int):
+        super().__init__()
+        # Match param budget of standard MLP: 2 * dim * hidden
+        standard_params = 2 * dim * mlp_mult * dim
+        # Bottleneck params: dim*neck + neck*wide + wide*dim = neck*dim + wide*(neck + dim)
+        # Solve for wide: wide = (standard_params - dim*neck) / (neck + dim)
+        wide_hidden = (standard_params - dim * bottleneck_dim) // (bottleneck_dim + dim)
+        self.fc1 = CastedLinear(dim, bottleneck_dim, bias=False)
+        self.fc2 = CastedLinear(bottleneck_dim, wide_hidden, bias=False)
+        self.proj = CastedLinear(wide_hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.relu(self.fc1(x)).square()
+        x = torch.relu(self.fc2(x))
+        return self.proj(x.square())
+
+
+def linear_scan(a: Tensor, b: Tensor) -> Tensor:
+    """Compute h[t] = a[t]*h[t-1] + b[t] via O(log T) iterative doubling.
+
+    a: (B, T, D) multiplicative coefficients (forget gates)
+    b: (B, T, D) additive coefficients ((1-f)*c)
+
+    Uses parallel prefix-sum with only log2(T) iterations of standard
+    tensor ops — compile-friendly (no dynamic control flow).
+    """
+    orig_dtype = a.dtype
+    a, b = a.float(), b.float()
+    T = a.shape[1]
+    for k in range(int(math.ceil(math.log2(max(T, 1))))):
+        stride = 2 ** k
+        a_prev = torch.cat([torch.ones_like(a[:, :stride, :]), a[:, :-stride, :]], dim=1)
+        b_prev = torch.cat([torch.zeros_like(b[:, :stride, :]), b[:, :-stride, :]], dim=1)
+        b = a * b_prev + b
+        a = a * a_prev
+    return b.to(orig_dtype)
+
+
+class GatedRecurrence(nn.Module):
+    """Gated linear recurrence (GRU-style) as a drop-in attention replacement.
+
+    Uses parallel scan for O(T log T) training. Produces forget/content/output
+    gates from the input, then runs a linear recurrence via parallel_scan.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gates_proj = CastedLinear(dim, 3 * dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        self.out_proj._zero_init = True
+        self.forget_bias = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, D = x.shape
+        gates = self.gates_proj(x)
+        f = torch.sigmoid(gates[:, :, :D] + self.forget_bias.to(dtype=x.dtype))
+        c = F.silu(gates[:, :, D:2*D])
+        o = torch.sigmoid(gates[:, :, 2*D:])
+        h = linear_scan(f, (1.0 - f) * c)
+        return self.out_proj(h * o)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -626,12 +703,22 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_type: str = "standard",
+        bottleneck_dim: int = 0,
+        mixer_type: str = "attention",
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        if mixer_type == "recurrent":
+            self.attn = GatedRecurrence(dim)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        if mlp_type == "bottleneck":
+            neck = bottleneck_dim if bottleneck_dim > 0 else dim // 4
+            self.mlp = BottleneckMLP(dim, mlp_mult, neck)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +746,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mlp_type: str = "standard",
+        bottleneck_dim: int = 0,
+        recurrent_layers: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -671,6 +761,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        recurrent_set = set(int(x) for x in recurrent_layers.split(",") if x.strip()) if recurrent_layers else set()
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -680,6 +771,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mlp_type=mlp_type,
+                    bottleneck_dim=bottleneck_dim,
+                    mixer_type="recurrent" if i in recurrent_set else "attention",
                 )
                 for i in range(num_layers)
             ]
@@ -835,6 +929,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mlp_type=args.mlp_type,
+        bottleneck_dim=args.bottleneck_dim,
+        recurrent_layers=args.recurrent_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -894,6 +991,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"mlp_type:{args.mlp_type} bottleneck_dim:{args.bottleneck_dim} recurrent_layers:{args.recurrent_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

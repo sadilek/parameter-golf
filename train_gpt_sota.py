@@ -83,6 +83,12 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
+    # Hybrid recurrent layers: comma-separated layer indices to use GatedRecurrence instead of attention.
+    recurrent_layers = os.environ.get("RECURRENT_LAYERS", "")
+    # LR for recurrent banks (Muon). If 0, falls back to matrix_lr.
+    rec_matrix_lr = float(os.environ.get("REC_MATRIX_LR", 0.0))
+    # SmearGate (per-channel mix with previous token) — redundant with GatedRecurrence
+    smear_enabled = bool(int(os.environ.get("SMEAR_ENABLED", "1")))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
@@ -750,6 +756,45 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+def linear_scan(a: Tensor, b: Tensor) -> Tensor:
+    """Compute h[t] = a[t]*h[t-1] + b[t] via O(log T) iterative doubling.
+
+    Uses parallel prefix-sum with only log2(T) iterations of standard
+    tensor ops — compile-friendly (no dynamic control flow).
+    """
+    orig_dtype = a.dtype
+    a, b = a.float(), b.float()
+    T = a.shape[1]
+    for k in range(int(math.ceil(math.log2(max(T, 1))))):
+        stride = 2 ** k
+        a_prev = torch.cat([torch.ones_like(a[:, :stride, :]), a[:, :-stride, :]], dim=1)
+        b_prev = torch.cat([torch.zeros_like(b[:, :stride, :]), b[:, :-stride, :]], dim=1)
+        b = a * b_prev + b
+        a = a * a_prev
+    return b.to(orig_dtype)
+
+
+class GatedRecurrence(nn.Module):
+    """Stateless gated linear recurrence — weights supplied from parameter banks.
+
+    Mirrors the CausalSelfAttention/MLP pattern: only holds the forget_bias scalar,
+    matrix weights (gates_proj, out_proj) are passed in from the GPT's rec_gates_bank
+    and rec_out_bank so they can be optimized by the banked Muon.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.forget_bias = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor, gates_w: Tensor, out_w: Tensor) -> Tensor:
+        B, T, D = x.shape
+        gates = F.linear(x, gates_w.to(dtype=x.dtype))
+        f = torch.sigmoid(gates[:, :, :D] + self.forget_bias.to(dtype=x.dtype))
+        c = F.silu(gates[:, :, D:2*D])
+        o = torch.sigmoid(gates[:, :, 2*D:])
+        h = linear_scan(f, (1.0 - f) * c)
+        return F.linear(h * o, out_w.to(dtype=x.dtype))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -764,12 +809,17 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        recurrent: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        gated_attention=gated_attention, value_residual=value_residual)
+        self.recurrent = recurrent
+        if recurrent:
+            self.attn = GatedRecurrence(dim)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                            gated_attention=gated_attention, value_residual=value_residual)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -781,10 +831,19 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor,
+                up_w: Tensor, down_w: Tensor,
+                q_w: Tensor | None = None, k_w: Tensor | None = None,
+                v_w: Tensor | None = None, out_w: Tensor | None = None,
+                gates_w: Tensor | None = None, rec_out_w: Tensor | None = None,
+                v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        if self.recurrent:
+            attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, gates_w, rec_out_w)
+            raw_v = None
+        else:
+            attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
@@ -819,9 +878,19 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        recurrent_layers: str = "",
+        smear_enabled: bool = True,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
+        self.recurrent_set = set(int(x) for x in recurrent_layers.split(",") if x.strip()) if recurrent_layers else set()
+        # Layer-index → bank-slot mapping. Attention banks and recurrent banks are
+        # sized to the number of layers of each type only (no wasted slots).
+        self.attn_layer_list = [i for i in range(num_layers) if i not in self.recurrent_set]
+        self.rec_layer_list = sorted(self.recurrent_set)
+        # Inverse maps: layer index → slot in the corresponding bank
+        self.attn_slot = {l: s for s, l in enumerate(self.attn_layer_list)}
+        self.rec_slot = {l: s for s, l in enumerate(self.rec_layer_list)}
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
@@ -832,20 +901,32 @@ class GPT(nn.Module):
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
+        self.smear = SmearGate(model_dim) if smear_enabled else nn.Identity()
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # Parameter banks: contiguous 3D tensors for batched optimizer
+        # Parameter banks: contiguous 3D tensors for batched optimizer.
+        # Attention banks cover only non-recurrent layers. Recurrent layers get
+        # their own banks (rec_gates_bank, rec_out_bank). MLP banks cover all layers.
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
-        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
+        n_attn = len(self.attn_layer_list)
+        n_rec = len(self.rec_layer_list)
+        self.n_attn = n_attn
+        self.qo_bank = nn.Parameter(torch.empty(2 * n_attn, model_dim, model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * n_attn, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        if n_rec > 0:
+            # Gates projection: dim → 3*dim. Out projection: dim → dim.
+            self.rec_gates_bank = nn.Parameter(torch.empty(n_rec, 3 * model_dim, model_dim))
+            self.rec_out_bank = nn.Parameter(torch.empty(n_rec, model_dim, model_dim))
+        else:
+            self.rec_gates_bank = None
+            self.rec_out_bank = None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -860,6 +941,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    recurrent=(i in self.recurrent_set),
                 )
                 for i in range(num_layers)
             ]
@@ -891,23 +973,32 @@ class GPT(nn.Module):
             head._zero_init = True
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
+                if not self.blocks[i].recurrent:
+                    self.blocks[i].attn.use_xsa = True
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         n = self.num_layers
+        n_attn = self.n_attn
         proj_scale = 1.0 / math.sqrt(2 * n)
-        # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
+        # Attention banks: orthogonal Q/K/V, zero Out (scaled by proj_scale)
+        for ai in range(n_attn):
+            nn.init.orthogonal_(self.qo_bank.data[ai], gain=1.0)         # Q
+            nn.init.zeros_(self.qo_bank.data[n_attn + ai])                # Out (zero init)
+            nn.init.orthogonal_(self.kv_bank.data[ai], gain=1.0)          # K
+            nn.init.orthogonal_(self.kv_bank.data[n_attn + ai], gain=1.0) # V
+            self.qo_bank.data[n_attn + ai].mul_(proj_scale)
+        # Recurrent banks: orthogonal gates, zero out (scaled by proj_scale)
+        if self.rec_gates_bank is not None:
+            for ri in range(self.rec_gates_bank.shape[0]):
+                nn.init.orthogonal_(self.rec_gates_bank.data[ri], gain=1.0)  # Gates
+                nn.init.zeros_(self.rec_out_bank.data[ri])                    # Out (zero init)
+                self.rec_out_bank.data[ri].mul_(proj_scale)
+        # MLP banks: orthogonal up, zero down (scaled by proj_scale), for all layers
         for i in range(n):
-            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
-            nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
-            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
-            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
-            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
-            # Scale proj layers (out_proj and mlp_down are "proj" layers)
-            self.qo_bank.data[n + i].mul_(proj_scale)
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)
+            nn.init.zeros_(self.mlp_down_bank.data[i])
             self.mlp_down_bank.data[i].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
@@ -925,8 +1016,29 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _block_call(self, block_idx: int, x: Tensor, x0: Tensor, input_ids: Tensor,
+                    v0: Tensor | None, ve_cache: dict) -> tuple[Tensor, Tensor | None]:
+        """Dispatch to either attention or recurrent block with correct bank slots."""
+        n_attn = self.n_attn
+        block = self.blocks[block_idx]
+        if block.recurrent:
+            ri = self.rec_slot[block_idx]
+            return block(
+                x, x0,
+                self.mlp_up_bank[block_idx], self.mlp_down_bank[block_idx],
+                gates_w=self.rec_gates_bank[ri], rec_out_w=self.rec_out_bank[ri],
+            )
+        ai = self.attn_slot[block_idx]
+        ve = self._get_ve(block_idx, input_ids, ve_cache)
+        return block(
+            x, x0,
+            self.mlp_up_bank[block_idx], self.mlp_down_bank[block_idx],
+            q_w=self.qo_bank[ai], k_w=self.kv_bank[ai], v_w=self.kv_bank[n_attn + ai],
+            out_w=self.qo_bank[n_attn + ai],
+            v_embed=ve, v0=v0,
+        )
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -937,11 +1049,7 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            x, raw_v = self._block_call(i, x, x0, input_ids, v0, ve_cache)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -949,11 +1057,7 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            x, _ = self._block_call(bi, x, x0, input_ids, v0, ve_cache)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -984,7 +1088,6 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -995,11 +1098,7 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            x, raw_v = self._block_call(i, x, x0, input_ids, v0, ve_cache)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1007,11 +1106,7 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            x, _ = self._block_call(bi, x, x0, input_ids, v0, ve_cache)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1263,6 +1358,11 @@ def _quantize_int6_percentile(t32, clip_range=31):
 
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
+    if "rec_gates_bank" in sd:
+        raise NotImplementedError(
+            "_unbank_state_dict does not yet support recurrent layer banks. "
+            "Either run with RECURRENT_LAYERS='' or SKIP_GPTQ=1."
+        )
     out: dict[str, Tensor] = {}
     n = num_layers
     for name, tensor in sd.items():
@@ -1286,6 +1386,11 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
 
 def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     """Convert individual 2D tensors back into 3D bank tensors."""
+    if "rec_gates_bank" in template_sd:
+        raise NotImplementedError(
+            "_rebank_state_dict does not yet support recurrent layer banks. "
+            "Either run with RECURRENT_LAYERS='' or SKIP_GPTQ=1."
+        )
     out: dict[str, Tensor] = {}
     n = num_layers
     # Reconstruct banks from individual weight keys
@@ -1405,14 +1510,15 @@ class _HessianGPT(nn.Module):
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
+                 smear_enabled=True):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
+        self.smear = SmearGate(model_dim) if smear_enabled else nn.Identity()
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1664,12 +1770,17 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        recurrent_layers=args.recurrent_layers,
+        smear_enabled=args.smear_enabled,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
     base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    if base_model.rec_gates_bank is not None:
+        base_model.rec_gates_bank.data = base_model.rec_gates_bank.data.float()
+        base_model.rec_out_bank.data = base_model.rec_out_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1684,10 +1795,23 @@ def main() -> None:
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
-    matrix_params = [
+    # Muon param groups: attention/MLP banks use matrix_lr; recurrent banks use rec_matrix_lr.
+    main_matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
+    rec_matrix_params: list = []
+    if base_model.rec_gates_bank is not None:
+        rec_matrix_params.append(base_model.rec_gates_bank)
+        rec_matrix_params.append(base_model.rec_out_bank)
+    rec_lr = args.rec_matrix_lr if args.rec_matrix_lr > 0.0 else args.matrix_lr
+    muon_param_groups: list[dict] = [
+        {"params": main_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr},
+    ]
+    if rec_matrix_params:
+        muon_param_groups.append(
+            {"params": rec_matrix_params, "lr": rec_lr, "base_lr": rec_lr}
+        )
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
@@ -1696,7 +1820,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear.gate)
+    if isinstance(base_model.smear, SmearGate):
+        scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1720,14 +1845,12 @@ def main() -> None:
         fused=True,
     )
     optimizer_muon = Muon(
-        matrix_params,
+        muon_param_groups,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1757,8 +1880,10 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    xsa_layers = [i for i, b in enumerate(base_model.blocks) if not b.recurrent and b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    recurrent_layer_indices = sorted(base_model.recurrent_set)
+    log0(f"recurrent_layers:{recurrent_layer_indices} recurrent_count:{len(recurrent_layer_indices)} rec_matrix_lr:{rec_lr}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1842,11 +1967,16 @@ def main() -> None:
             mtp_num_heads=0, bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
             xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
             ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            recurrent_layers=args.recurrent_layers,
+            smear_enabled=args.smear_enabled,
         ).to(device).bfloat16()
         eval_model.qo_bank.data = eval_model.qo_bank.data.float()
         eval_model.kv_bank.data = eval_model.kv_bank.data.float()
         eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
         eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+        if eval_model.rec_gates_bank is not None:
+            eval_model.rec_gates_bank.data = eval_model.rec_gates_bank.data.float()
+            eval_model.rec_out_bank.data = eval_model.rec_out_bank.data.float()
         for m in eval_model.modules():
             if isinstance(m, CastedLinear):
                 m.float()
@@ -2025,6 +2155,11 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
+    if int(os.environ.get("SKIP_GPTQ", "0")):
+        log0("SKIP_GPTQ=1 — bailing out after training, no quantization.")
+        if distributed:
+            dist.destroy_process_group()
+        return
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
@@ -2144,11 +2279,16 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        recurrent_layers=args.recurrent_layers,
+        smear_enabled=args.smear_enabled,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
     eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
     eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    if eval_model.rec_gates_bank is not None:
+        eval_model.rec_gates_bank.data = eval_model.rec_gates_bank.data.float()
+        eval_model.rec_out_bank.data = eval_model.rec_out_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()

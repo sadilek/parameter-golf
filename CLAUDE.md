@@ -82,6 +82,8 @@ GPT-style transformer with:
 
 - **Always copy results back to local machine.** After any GPU experiment, download float weights, logs, and artifacts to `saved_weights/` before stopping the pod. Pod volumes can be lost if pods are deleted.
 - **Stop pods immediately** after experiments finish. Never leave pods idle.
+- **A pod that never got a machine assigned (empty `machine` field) is still billing.** If create-pod succeeds but `machine` stays empty for >2 min, DELETE the pod — do not leave it "RUNNING" waiting for allocation. This burned ~$36 on a stuck H100 that sat for 14 hours.
+- **Always run `list-pods` when done** to verify all pods are EXITED or deleted. Leaving zombie pods behind is expensive.
 - **Use shell script files** for nohup commands (not inline bash -c) to avoid env var escaping issues.
 - **Use PYTHONUNBUFFERED=1** or `python -u` when redirecting output via nohup.
 - **Use grad_accum>=8** for eval_val on 13L+ models — smaller batches cause silent OOM and wrong BPB.
@@ -92,7 +94,14 @@ GPT-style transformer with:
 - **6-bit packing hurts with zstd** — zstd already handles the wasted bits in int8. Packing removes the patterns zstd exploits, making artifacts ~33% larger.
 - **torch.compile segfaults on some pods** (PyTorch 2.4.1 + A100 PCIe pod `kj0v7b0djsxzsp`). Guard compile calls with COMPILE_MODE=off support.
 - **1cycle LR destabilizes at long training.** Works great at 500-1000 steps, but diverges at 2000-5000 steps. Use warmdown schedule for long runs.
+- **Short-iteration A/B tests silently collapse the LR schedule.** If `iterations < warmdown_iters` then `warmdown_start = 0` and the entire run is warmdown — effective LR can be 50× lower than production. A/B results in this regime DO NOT predict full-training behavior: we saw a hybrid architecture "win by -0.18 BPB" at 400 steps then LOSE by +0.05 at 20000 steps. When screening short, either set `WARMDOWN_ITERS=100` (small fraction of iterations) or accept that the results are near-init noise.
 - **LOAD_WEIGHTS resumes model but NOT the LR schedule.** Don't resume training with a fresh 1cycle — it will ramp LR up on an already-converged model and diverge.
+- **Use a local venv for quick CPU-only torch tests** (e.g., unit tests of math/causality). Don't spin up a pod for ~50-line test scripts — creates the wrong cost/latency trade-off.
+  ```bash
+  python3 -m venv /tmp/pgolf-venv
+  source /tmp/pgolf-venv/bin/activate
+  pip install torch --index-url https://download.pytorch.org/whl/cpu
+  ```
 
 ## SOTA Reference (PR #1019, 1.115 BPB)
 

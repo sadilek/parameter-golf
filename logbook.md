@@ -904,6 +904,84 @@ Key techniques from @abaybektursun:
 - Convnet can't handle 192 tokens (strides assume 256), so use a separate encoder: mean-pool + Linear projection to `(1, model_dim)`
 - Benefit: global summaries become conditioned on recent context before cross-attention. Second-order effect — the local decoder already has direct self-attention to the prefix. Worth testing after baseline.
 
+### Batch size scheduling 💡 **Novel** (no submissions use it)
+- Start small batch (131K), switch to large (786K) at ~33% of training
+- Smith et al. 2018: small batch = more updates = faster exploration; large batch = precise convergence
+- `train_combined.py` already has this (`batch_schedule_fraction=0.33`), but no submitted record uses it
+- Extra relevant for hybrid recurrent: scan overhead is fixed per step regardless of batch size, so penalty is proportionally smaller at large batch
+- Could also try continuous ramp instead of step function
+
+### Hybrid recurrent-attention architecture ❌ **Novel** — **DOESN'T WORK AT FULL TRAINING**
+- Replace early attention layers with stateless GatedRecurrence (GRU-style gated linear recurrence + parallel scan)
+- Parallel scan with log2(T) doublings — compile-friendly with `fullgraph=True`
+- Dedicated banks (`rec_gates_bank`, `rec_out_bank`) shrinking `qo_bank`/`kv_bank` to non-recurrent layers only
+- GatedRecurrence is stateless — weights come from banks, optimized via banked Muon (same LR as attention matrices)
+
+- **Simple baseline sweep** (train_gpt.py, A100 + compile, 300 steps, seq=2048, baseline BPB=1.7436):
+
+| Config | layers | step 300 BPB | roundtrip BPB | ms/step | Δ BPB |
+|---|---|---|---|---|---|
+| baseline | — | 1.7436 | 1.7724 | 247 | — |
+| rec_0 | [0] | 1.7043 | 1.7310 | 263 | -0.041 |
+| rec_4 | [4] | 1.7255 | 1.7528 | 263 | -0.020 |
+| rec_8 | [8] | 1.7435 | 1.7699 | 263 | -0.003 |
+| **rec_012** | [0,1,2] | **1.6675** | **1.6924** | 293 | **-0.080** |
+| rec_345 | [3,4,5] | 1.6998 | 1.7253 | 293 | -0.047 |
+| rec_678 | [6,7,8] | 1.7208 | 1.7476 | 296 | -0.025 |
+| rec_0246 | [0,2,4,6] | 1.6801 | 1.7051 | 307 | -0.067 |
+
+- **SOTA architecture verification** (train_gpt_sota.py, A100 + compile, **400 steps**, seq=2048, rec_matrix_lr=0.025):
+
+| Config | Params | step 100 | step 200 | step 300 | step 400 | Δ vs baseline | ms/step |
+|---|---|---|---|---|---|---|---|
+| baseline | 26.99M | 2.2092 | 2.0023 | 1.9076 | **1.8781** | — | 336 |
+| **rec_012** | 27.78M (+2.9%) | 2.0859 | 1.8266 | 1.7261 | **1.6966** | **-0.182** | 390 (+16%) |
+
+- **rec_matrix_lr sweep** (rec_012 @ 300 iters, finding right LR for recurrent Muon banks):
+  - 0.025 → 2.0071 (best, -0.109 vs baseline 2.1163)
+  - 0.0125 → 2.2125 (+0.096)
+  - 0.006 → 2.3383 (+0.222)
+  - 0.003 → 2.3892 (+0.273)
+  - 0.001 → 2.4107 (+0.294)
+- **Use matrix_lr for rec banks** — lower LRs undertrain. Same LR as main attention banks is optimal.
+
+- **Key findings**:
+  - Gap WIDENS over training (step 100: -0.123, step 400: -0.182) — hybrid improves faster and keeps pulling ahead
+  - Earlier layers benefit more (layer 0 >> layer 8)
+  - Contiguous early beats alternating (rec_012 > rec_0246)
+  - +16% step time overhead for -0.182 BPB gain
+  - Works even stacked on top of SOTA's Bigram/SmearGate/XSA/VE/LN-scale features
+
+- **Implementation caveats**:
+  - GatedRecurrence must be stateless (weights from banks), NOT per-layer nn.Linear modules — otherwise they go to AdamW scalar group and undertrain
+  - Rec banks need their own Muon param group (same matrix_lr is fine)
+  - Zero-init the `rec_out_bank` (like attention's proj) — critical for stable start
+  - Unbank/rebank state dict helpers need NotImplementedError guard for recurrent layers until GPTQ path is extended
+
+- **Full 10-min 8xH100 run** (SOTA config, iterations=20000, batch=786K, full LR schedule):
+
+| Config | Final step | Val BPB | Post-EMA | ms/step |
+|---|---|---|---|---|
+| baseline | 5457 | 1.1491 | **1.1483** | 110 |
+| rec_012 | 4509 | 1.1975 | 1.1967 | 133 (+21%) |
+
+- **Hybrid LOSES by +0.048 BPB at full training.** All earlier "wins" were bogus due to warmdown schedule collapse:
+  - Our A/B tests used `iterations=300-400` with `warmdown_iters=3500` (default).
+  - Formula: `warmdown_start = max(iterations - warmdown_iters, 0) = 0` → entire run is in warmdown.
+  - At step 100 of a 400-iter run: `lr_mul = 300/3500 = 0.086` → effective LR = 0.00215 (50× lower than production).
+  - Plus batch_tokens was 131K vs production 786K (6× smaller).
+  - Combined: short runs had ~70× less learning signal per step.
+  - **At artificially low LR, GatedRecurrence with zero-init out_proj drifts slower and looks "ahead" — but this is near-init noise, not real learning advantage.**
+  - At real LR, attention learns faster than gated recurrence, and hybrid just costs +21% step time for no gain.
+- **Lesson: short-iteration A/B tests with default warmdown are unreliable.** For meaningful screening at short iterations, set `WARMDOWN_ITERS` to a small fraction of `ITERATIONS` (e.g., 100 for a 500-step run), or run at full config length.
+- **Decision**: drop the hybrid approach. GatedRecurrence clean refactor stays in `train_gpt_sota.py` behind `RECURRENT_LAYERS` env var for future exploration but not used by submissions.
+
+### Bottleneck MLP ❌ | **Novel**
+- Replace standard MLP (512->1024->512) with bottleneck (512->128->1536->512), same param count
+- Two nonlinearities instead of one, 50% wider hidden layer
+- Result: **+0.031 BPB worse** at 500 steps, 15% slower
+- Information bottleneck at 128 dims too restrictive for compression task
+
 ### FP8 training 💡
 - torch.float8_e4m3fn available on PyTorch 2.4.1 + A100/H100
 - Could give ~1.5-2× faster matmuls → more steps in 10 min
